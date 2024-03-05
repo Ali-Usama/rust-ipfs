@@ -15,7 +15,7 @@ use libipld::Cid;
 use ll::file::FileReadFailed;
 pub use rust_unixfs as ll;
 
-mod add;
+pub mod add;
 mod cat;
 mod get;
 mod ls;
