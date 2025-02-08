@@ -5,7 +5,7 @@ use crate::Block;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryFutureExt, TryStreamExt};
-use libipld::Cid;
+use ipld_core::cid::Cid;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,10 +42,6 @@ impl BlockStore for FsBlockStore {
         Ok(())
     }
 
-    async fn open(&self) -> Result<(), Error> {
-        Ok(())
-    }
-
     async fn contains(&self, cid: &Cid) -> Result<bool, Error> {
         let inner = &*self.inner.read().await;
         inner.contains(cid).await
@@ -68,7 +64,7 @@ impl BlockStore for FsBlockStore {
 
     //TODO: Allow multiple puts without holding a lock. We could probably hold a read lock instead
     //      and revert back to using a broadcast
-    async fn put(&self, block: Block) -> Result<(Cid, BlockPut), Error> {
+    async fn put(&self, block: &Block) -> Result<(Cid, BlockPut), Error> {
         let inner = &mut *self.inner.write().await;
         inner.put(block).await
     }
@@ -138,7 +134,8 @@ impl FsBlockStoreInner {
         .await?
     }
 
-    async fn put(&mut self, block: Block) -> Result<(Cid, BlockPut), Error> {
+    async fn put(&mut self, block: &Block) -> Result<(Cid, BlockPut), Error> {
+        let block = block.clone();
         let target_path = block_path(self.path.clone(), block.cid());
         let cid = *block.cid();
 
@@ -313,12 +310,11 @@ fn write_through_tempfile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockCodec;
     use crate::Block;
     use hex_literal::hex;
-    use libipld::{
-        multihash::{Code, MultihashDigest},
-        Cid, IpldCodec,
-    };
+    use ipld_core::cid::Cid;
+    use multihash_codetable::{Code, MultihashDigest};
     use std::convert::TryFrom;
     use std::env::temp_dir;
     use std::sync::Arc;
@@ -331,11 +327,10 @@ mod tests {
         let store = FsBlockStore::new(tmp.clone());
 
         let data = b"1".to_vec();
-        let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data));
+        let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data));
         let block = Block::new(cid, data).unwrap();
 
         store.init().await.unwrap();
-        store.open().await.unwrap();
 
         let contains = store.contains(&cid).await.unwrap();
         assert!(!contains);
@@ -345,7 +340,7 @@ mod tests {
             panic!("block should not be found")
         }
 
-        let put = store.put(block.clone()).await.unwrap();
+        let put = store.put(&block).await.unwrap();
         assert_eq!(put.0, cid.to_owned());
         let contains = store.contains(&cid);
         assert!(contains.await.unwrap());
@@ -368,18 +363,16 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
 
         let data = b"1".to_vec();
-        let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data));
+        let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data));
         let block = Block::new(cid, data).unwrap();
 
         let block_store = FsBlockStore::new(tmp.clone());
         block_store.init().await.unwrap();
-        block_store.open().await.unwrap();
 
         assert!(!block_store.contains(block.cid()).await.unwrap());
-        block_store.put(block.clone()).await.unwrap();
+        block_store.put(&block).await.unwrap();
 
         let block_store = FsBlockStore::new(tmp.clone());
-        block_store.open().await.unwrap();
         assert!(block_store.contains(block.cid()).await.unwrap());
         assert_eq!(block_store.get(block.cid()).await.unwrap().unwrap(), block);
 
@@ -394,13 +387,12 @@ mod tests {
 
         let block_store = FsBlockStore::new(tmp.clone());
         block_store.init().await.unwrap();
-        block_store.open().await.unwrap();
 
         for data in &[b"1", b"2", b"3"] {
             let data_slice = data.to_vec();
-            let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data_slice));
+            let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data_slice));
             let block = Block::new(cid, data_slice).unwrap();
-            block_store.put(block.clone()).await.unwrap();
+            block_store.put(&block).await.unwrap();
         }
 
         let cids = block_store.list().await.collect::<Vec<_>>().await;
@@ -425,7 +417,7 @@ mod tests {
         let cid = Cid::try_from("QmRgutAxd8t7oGkSm4wmeuByG6M51wcTso6cubDdQtuEfL").unwrap();
         let data = hex!("0a0d08021207666f6f6261720a1807");
 
-        let block = Block::new(cid, data.into()).unwrap();
+        let block = Block::new(cid, data.to_vec()).unwrap();
 
         let count = 10;
 
@@ -450,7 +442,7 @@ mod tests {
                     let block = block.clone();
                     async move {
                         barrier.wait().await;
-                        bs.put(block).await
+                        bs.put(&block).await
                     }
                 })
             })
@@ -487,11 +479,11 @@ mod tests {
         let cid = Cid::try_from("QmRgutAxd8t7oGkSm4wmeuByG6M51wcTso6cubDdQtuEfL").unwrap();
         let data = hex!("0a0d08021207666f6f6261720a1807");
 
-        let block = Block::new(cid, data.into()).unwrap();
+        let block = Block::new(cid, data.to_vec()).unwrap();
 
         assert_eq!(single.list().await.collect::<Vec<_>>().await.len(), 0);
 
-        single.put(block).await.unwrap();
+        single.put(&block).await.unwrap();
 
         // compare the multihash since we store the block named as cidv1
         assert_eq!(

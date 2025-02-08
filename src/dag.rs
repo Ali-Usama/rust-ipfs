@@ -1,27 +1,26 @@
 //! `ipfs.dag` interface implementation around [`Ipfs`].
 
+use crate::block::BlockCodec;
 use crate::error::Error;
 use crate::path::{IpfsPath, PathRoot, SlashedPath};
 use crate::repo::Repo;
 use crate::{Block, Ipfs};
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use libipld::serde::{from_ipld, to_ipld};
-use libipld::{
-    cid::{
-        multihash::{Code, MultihashDigest},
-        Cid, Version,
-    },
-    codec::Codec,
-    Ipld, IpldCodec,
-};
+use ipld_core::cid::{Cid, Version};
+use ipld_core::codec::Codec;
+use ipld_core::ipld::Ipld;
+use ipld_core::serde::{from_ipld, to_ipld};
 use libp2p::PeerId;
+use multihash_codetable::{Code, MultihashDigest};
 use rust_unixfs::{
     dagpb::{wrap_node_data, NodeData},
     dir::{Cache, ShardedLookup},
     resolve, MaybeResolved,
 };
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::convert::TryFrom;
 use std::error::Error as StdError;
 use std::iter::Peekable;
@@ -59,7 +58,7 @@ pub enum ResolveError {
     NoLinks(Cid, SlashedPath),
 
     /// Path attempted to resolve through a property, index or link which did not exist.
-    #[error("no link named {:?} under {0}", .1.iter().last().unwrap())]
+    #[error("no link named {n:?} under {0}", n = .1.iter().last().unwrap())]
     NotFound(Cid, SlashedPath),
 
     /// Tried to use a path neiter containing nor resolving to a Cid.
@@ -201,14 +200,14 @@ impl IpldDag {
     /// Puts an ipld node into the ipfs repo using `dag-cbor` codec and Sha2_256 hash.
     ///
     /// Returns Cid version 1 for the document
-    pub fn put_dag(&self, ipld: Ipld) -> DagPut {
-        self.put().ipld(ipld)
+    pub fn put_dag(&self, ipld: impl Serialize) -> DagPut {
+        self.put().serialize(ipld)
     }
 
     /// Gets an ipld node from the ipfs, fetching the block if necessary.
     ///
     /// See [`IpldDag::get`] for more information.
-    pub fn get_dag<I: Into<IpfsPath>>(&self, path: I) -> DagGet {
+    pub fn get_dag(&self, path: impl Into<IpfsPath>) -> DagGet {
         self.get().path(path)
     }
 
@@ -226,9 +225,8 @@ impl IpldDag {
         DagGet::new(self.clone())
     }
 
-    pub(crate) async fn get_with_session(
+    pub(crate) async fn _get(
         &self,
-        session: Option<u64>,
         path: IpfsPath,
         providers: &[PeerId],
         local_only: bool,
@@ -255,9 +253,7 @@ impl IpldDag {
         let mut iter = resolved_path.iter().peekable();
 
         let (node, _) = match self
-            .resolve0(
-                session, cid, &mut iter, true, providers, local_only, timeout,
-            )
+            .resolve0(cid, &mut iter, true, providers, local_only, timeout)
             .await
         {
             Ok(t) => t,
@@ -288,13 +284,12 @@ impl IpldDag {
         providers: &[PeerId],
         local_only: bool,
     ) -> Result<(ResolvedNode, SlashedPath), ResolveError> {
-        self.resolve_with_session(None, path, follow_links, providers, local_only, None)
+        self._resolve(path, follow_links, providers, local_only, None)
             .await
     }
 
-    pub(crate) async fn resolve_with_session(
+    pub(crate) async fn _resolve(
         &self,
-        session: Option<u64>,
         path: IpfsPath,
         follow_links: bool,
         providers: &[PeerId],
@@ -322,15 +317,7 @@ impl IpldDag {
         let (node, matched_segments) = {
             let mut iter = resolved_path.iter().peekable();
             match self
-                .resolve0(
-                    session,
-                    cid,
-                    &mut iter,
-                    follow_links,
-                    providers,
-                    local_only,
-                    timeout,
-                )
+                .resolve0(cid, &mut iter, follow_links, providers, local_only, timeout)
                 .await
             {
                 Ok(t) => t,
@@ -353,7 +340,6 @@ impl IpldDag {
     #[allow(clippy::too_many_arguments)]
     async fn resolve0<'a>(
         &self,
-        session: Option<u64>,
         cid: &Cid,
         segments: &mut Peekable<impl Iterator<Item = &'a str>>,
         follow_links: bool,
@@ -371,7 +357,10 @@ impl IpldDag {
         loop {
             let block = match self
                 .repo
-                .get_block_with_session(session, &current, providers, local_only, timeout)
+                .get_block(current)
+                .providers(providers)
+                .set_local(local_only)
+                .timeout(timeout)
                 .await
             {
                 Ok(block) => block,
@@ -428,7 +417,12 @@ impl IpldDag {
         loop {
             let (next, _) = lookup.pending_links();
 
-            let block = self.repo.get_block(next, providers, local_only).await?;
+            let block = self
+                .repo
+                .get_block(next)
+                .providers(providers)
+                .set_local(local_only)
+                .await?;
 
             match lookup.continue_walk(block.data(), cache)? {
                 NeedToLoadMore(next) => lookup = next,
@@ -442,7 +436,6 @@ impl IpldDag {
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct DagGet {
     dag_ipld: IpldDag,
-    session: Option<u64>,
     path: Option<IpfsPath>,
     providers: Vec<PeerId>,
     local: bool,
@@ -454,7 +447,6 @@ impl DagGet {
     pub fn new(dag: IpldDag) -> Self {
         Self {
             dag_ipld: dag,
-            session: None,
             path: None,
             providers: vec![],
             local: false,
@@ -463,15 +455,8 @@ impl DagGet {
         }
     }
 
-    /// Bitswap session
-    #[allow(dead_code)]
-    pub(crate) fn session(mut self, session: u64) -> Self {
-        self.session = Some(session);
-        self
-    }
-
     /// Path to object
-    pub fn path<P: Into<IpfsPath>>(mut self, path: P) -> Self {
+    pub fn path(mut self, path: impl Into<IpfsPath>) -> Self {
         let path = path.into();
         self.path = Some(path);
         self
@@ -479,13 +464,15 @@ impl DagGet {
 
     /// Peer that may contain the block
     pub fn provider(mut self, peer_id: PeerId) -> Self {
-        self.providers.push(peer_id);
+        if !self.providers.contains(&peer_id) {
+            self.providers.push(peer_id);
+        }
         self
     }
 
     /// List of peers that may contain the block
     pub fn providers(mut self, providers: &[PeerId]) -> Self {
-        self.providers = providers.to_vec();
+        self.providers = providers.into();
         self
     }
 
@@ -532,13 +519,7 @@ impl std::future::IntoFuture for DagGet {
         async move {
             let path = self.path.ok_or(ResolveError::PathNotProvided)?;
             self.dag_ipld
-                .get_with_session(
-                    self.session,
-                    path,
-                    &self.providers,
-                    self.local,
-                    self.timeout,
-                )
+                ._get(path, &self.providers, self.local, self.timeout)
                 .await
         }
         .instrument(span)
@@ -574,7 +555,7 @@ where
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct DagPut {
     dag_ipld: IpldDag,
-    codec: IpldCodec,
+    codec: BlockCodec,
     data: Box<dyn FnOnce() -> anyhow::Result<Ipld> + Send + 'static>,
     hash: Code,
     pinned: Option<bool>,
@@ -586,7 +567,7 @@ impl DagPut {
     pub fn new(dag: IpldDag) -> Self {
         Self {
             dag_ipld: dag,
-            codec: IpldCodec::DagCbor,
+            codec: BlockCodec::DagCbor,
             data: Box::new(|| anyhow::bail!("data not available")),
             hash: Code::Sha2_256,
             pinned: None,
@@ -596,13 +577,12 @@ impl DagPut {
     }
 
     /// Set a ipld object
-    pub fn ipld(mut self, data: Ipld) -> Self {
-        self.data = Box::new(move || Ok(data));
-        self
+    pub fn ipld(self, data: Ipld) -> Self {
+        self.serialize(data)
     }
 
     /// Set a serde-compatible object
-    pub fn serialize<S: serde::Serialize>(mut self, data: S) -> Self {
+    pub fn serialize(mut self, data: impl serde::Serialize) -> Self {
         let result = to_ipld(data).map_err(anyhow::Error::from);
         self.data = Box::new(move || result);
         self
@@ -627,7 +607,7 @@ impl DagPut {
     }
 
     /// Set codec for ipld
-    pub fn codec(mut self, codec: IpldCodec) -> Self {
+    pub fn codec(mut self, codec: BlockCodec) -> Self {
         self.codec = codec;
         self
     }
@@ -654,18 +634,27 @@ impl std::future::IntoFuture for DagPut {
             let _g = self.dag_ipld.repo.gc_guard().await;
 
             let data = (self.data)()?;
+            let bytes = match self.codec {
+                BlockCodec::Raw => from_ipld(data)?,
+                BlockCodec::DagCbor => {
+                    serde_ipld_dagcbor::codec::DagCborCodec::encode_to_vec(&data)?
+                }
+                BlockCodec::DagJson => {
+                    serde_ipld_dagjson::codec::DagJsonCodec::encode_to_vec(&data)?
+                }
+                BlockCodec::DagPb => ipld_dagpb::from_ipld(&data)?,
+            };
 
-            let bytes = self.codec.encode(&data)?;
             let code = self.hash;
             let hash = code.digest(&bytes);
-            let version = if self.codec == IpldCodec::DagPb {
+            let version = if self.codec == BlockCodec::DagPb {
                 Version::V0
             } else {
                 Version::V1
             };
             let cid = Cid::new(version, self.codec.into(), hash)?;
             let block = Block::new(cid, bytes)?;
-            let cid = self.dag_ipld.repo.put_block(block).await?;
+            let cid = self.dag_ipld.repo.put_block(&block).await?;
 
             if let Some(opt) = self.pinned {
                 if !self.dag_ipld.repo.is_pinned(&cid).await? {
@@ -699,7 +688,7 @@ pub enum ResolvedNode {
     /// Path ended in `Data` at a dag-pb node. This is usually not interesting and should be
     /// treated as a "Not found" error since dag-pb node did not have a *link* called `Data`. The variant
     /// exists as there are interface-ipfs-http tests which require this behaviour.
-    DagPbData(Cid, NodeData<Box<[u8]>>),
+    DagPbData(Cid, NodeData<Bytes>),
     /// Path ended on a !dag-pb document which was projected.
     Projection(Cid, Ipld),
     /// Local resolving ended with a link
@@ -720,9 +709,9 @@ impl ResolvedNode {
     /// Unwraps the dagpb block variant and turns others into UnexpectedResolved.
     /// This is useful wherever unixfs operations are continued after resolving an IpfsPath.
     pub fn into_unixfs_block(self) -> Result<Block, UnexpectedResolved> {
-        if self.source().codec() != <IpldCodec as Into<u64>>::into(IpldCodec::DagPb) {
+        if self.source().codec() != <BlockCodec as Into<u64>>::into(BlockCodec::DagPb) {
             Err(UnexpectedResolved::UnexpectedCodec(
-                IpldCodec::DagPb.into(),
+                BlockCodec::DagPb.into(),
                 self,
             ))
         } else {
@@ -741,7 +730,7 @@ impl TryFrom<ResolvedNode> for Ipld {
 
         match r {
             Block(block) => Ok(block
-                .decode::<IpldCodec, Ipld>()
+                .to_ipld()
                 .map_err(move |e| ResolveError::UnsupportedDocument(*block.cid(), e.into()))?),
             DagPbData(_, node_data) => Ok(Ipld::Bytes(node_data.node_data().to_vec())),
             Projection(_, ipld) => Ok(ipld),
@@ -788,7 +777,7 @@ fn resolve_local<'a>(
         return Ok((LocallyResolved::Complete(ResolvedNode::Block(block)), 0));
     }
 
-    if block.cid().codec() == <IpldCodec as Into<u64>>::into(IpldCodec::DagPb) {
+    if block.cid().codec() == <BlockCodec as Into<u64>>::into(BlockCodec::DagPb) {
         // special-case the dagpb since we need to do the HAMT lookup and going through the
         // BTreeMaps of ipld for this is quite tiresome. if you are looking for that code for
         // simple directories, you can find one in the history of ipfs-http.
@@ -800,13 +789,13 @@ fn resolve_local<'a>(
         let (cid, data) = block.into_inner();
         Ok(resolve_local_dagpb(
             cid,
-            data.into(),
+            data,
             segment,
             segments.peek().is_none(),
             cache,
         )?)
     } else {
-        let ipld = match block.decode::<IpldCodec, Ipld>() {
+        let ipld = match block.to_ipld() {
             Ok(ipld) => ipld,
             Err(e) => {
                 return Err(RawResolveLocalError::UnsupportedDocument(
@@ -824,7 +813,7 @@ fn resolve_local<'a>(
 /// `ResolvedNode::DagPbData`.
 fn resolve_local_dagpb<'a>(
     cid: Cid,
-    data: Box<[u8]>,
+    data: Bytes,
     segment: &'a str,
     is_last: bool,
     cache: &mut Option<Cache>,
@@ -953,7 +942,8 @@ fn resolve_local_ipld<'a>(
 mod tests {
     use super::*;
     use crate::Node;
-    use libipld::{cbor::DagCborCodec, ipld};
+    use ipld_core::ipld;
+    use serde_ipld_dagcbor::codec::DagCborCodec;
 
     #[tokio::test]
     async fn test_resolve_root_cid() {
@@ -1268,7 +1258,7 @@ mod tests {
         let (cid, data) = blocks.next().unwrap();
         assert_eq!(blocks.next(), None);
 
-        ipfs.put_block(Block::new(cid, data).unwrap())
+        ipfs.put_block(&Block::new(cid, data).unwrap())
             .await
             .unwrap();
 
@@ -1301,7 +1291,7 @@ mod tests {
 
         let total_size = data.len();
 
-        ipfs.put_block(Block::new(cid, data).unwrap())
+        ipfs.put_block(&Block::new(cid, data).unwrap())
             .await
             .unwrap();
 
@@ -1317,9 +1307,9 @@ mod tests {
 
         while let Some(node) = iter.next_borrowed() {
             let node = node.unwrap();
-            let block = Block::new(node.cid.to_owned(), node.block.into()).unwrap();
+            let block = Block::new(node.cid.to_owned(), node.block.to_vec()).unwrap();
 
-            ipfs.put_block(block).await.unwrap();
+            ipfs.put_block(&block).await.unwrap();
 
             cids.push(node.cid.to_owned());
         }
@@ -1352,7 +1342,7 @@ mod tests {
             "foo": Ipld::Null,
         });
 
-        let bytes = DagCborCodec.encode(&map).unwrap();
+        let bytes = DagCborCodec::encode_to_vec(&map).unwrap();
 
         assert_eq!(
             bytes.as_slice(),

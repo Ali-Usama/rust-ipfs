@@ -22,7 +22,6 @@ impl<T: DataStore> DSTestContext<T> {
         let ds = factory(p);
 
         ds.init().await.unwrap();
-        ds.open().await.unwrap();
 
         DSTestContext {
             tempdir,
@@ -50,7 +49,7 @@ macro_rules! pinstore_interface_tests {
         mod $module_name {
 
             use futures::{StreamExt, TryStreamExt};
-            use libipld::Cid;
+            use ipld_core::cid::Cid;
             use std::collections::HashMap;
             use std::convert::TryFrom;
             use $crate::repo::common_tests::DSTestContext;

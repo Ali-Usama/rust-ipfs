@@ -1,28 +1,30 @@
 //! Storage implementation(s) backing the [`crate::Ipfs`].
 use crate::error::Error;
-use crate::{Block, StoragePath};
-use anyhow::anyhow;
+use crate::{Block, StorageType};
 use async_trait::async_trait;
 use core::fmt::Debug;
 use futures::channel::mpsc::{channel, Receiver, Sender};
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, Either};
 use futures::sink::SinkExt;
 use futures::stream::{self, BoxStream, FuturesOrdered};
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use libipld::cid::Cid;
-use libipld::{Ipld, IpldCodec};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use indexmap::IndexSet;
+use ipld_core::cid::Cid;
 use libp2p::identity::PeerId;
 use parking_lot::{Mutex, RwLock};
 use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap};
+use std::future::{Future, IntoFuture};
+#[allow(unused_imports)]
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{error, fmt, io};
-use tokio::sync::RwLockReadGuard;
-use tracing::{log, Span};
-use tracing_futures::Instrument;
+use tokio::sync::{Notify, RwLockReadGuard};
+use tracing::{Instrument, Span};
 
 #[macro_use]
 #[cfg(test)]
@@ -33,6 +35,7 @@ pub mod datastore;
 pub mod lock;
 
 /// Path mangling done for pins and blocks
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod paths;
 
 /// Describes the outcome of `BlockStore::put_block`.
@@ -63,10 +66,13 @@ pub enum BlockRmError {
 
 /// This API is being discussed and evolved, which will likely lead to breakage.
 #[async_trait]
-pub trait BlockStore: Debug + Send + Sync + 'static {
+pub trait BlockStore: Debug + Send + Sync {
     async fn init(&self) -> Result<(), Error>;
-    /// FIXME: redundant and never called during initialization, which is expected to happen during [`init`].
-    async fn open(&self) -> Result<(), Error>;
+
+    #[deprecated]
+    async fn open(&self) -> Result<(), Error> {
+        Ok(())
+    }
     /// Returns whether a block is present in the blockstore.
     async fn contains(&self, cid: &Cid) -> Result<bool, Error>;
     /// Returns a block from the blockstore.
@@ -76,7 +82,7 @@ pub trait BlockStore: Debug + Send + Sync + 'static {
     /// Get a total size of the block store
     async fn total_size(&self) -> Result<usize, Error>;
     /// Inserts a block in the blockstore.
-    async fn put(&self, block: Block) -> Result<(Cid, BlockPut), Error>;
+    async fn put(&self, block: &Block) -> Result<(Cid, BlockPut), Error>;
     /// Removes a block from the blockstore.
     async fn remove(&self, cid: &Cid) -> Result<(), Error>;
     /// Remove multiple blocks from the blockstore
@@ -87,9 +93,12 @@ pub trait BlockStore: Debug + Send + Sync + 'static {
 
 #[async_trait]
 /// Generic layer of abstraction for a key-value data store.
-pub trait DataStore: PinStore + Debug + Send + Sync + 'static {
+pub trait DataStore: PinStore + Debug + Send + Sync {
     async fn init(&self) -> Result<(), Error>;
-    async fn open(&self) -> Result<(), Error>;
+    #[deprecated]
+    async fn open(&self) -> Result<(), Error> {
+        Ok(())
+    }
     /// Checks if a key is present in the datastore.
     async fn contains(&self, key: &[u8]) -> Result<bool, Error>;
     /// Returns the value associated with a key from the datastore.
@@ -178,15 +187,15 @@ impl error::Error for LockError {
 ///
 /// This ensures no two IPFS nodes can be started with the same peer ID, as exclusive access to the
 /// repository is guarenteed. This is most useful when using an fs backed repo.
-pub trait Lock: Debug + Send + Sync + 'static {
+pub trait Lock: Debug + Send + Sync {
     // fn new(path: PathBuf) -> Self;
     fn try_exclusive(&self) -> Result<(), LockError>;
 }
 
-type References<'a> = futures::stream::BoxStream<'a, Result<Cid, crate::refs::IpldRefsError>>;
+type References<'a> = BoxStream<'a, Result<Cid, crate::refs::IpldRefsError>>;
 
 #[async_trait]
-pub trait PinStore: Debug + Send + Sync + Unpin + 'static {
+pub trait PinStore: Debug + Send + Sync {
     async fn is_pinned(&self, block: &Cid) -> Result<bool, Error>;
 
     async fn insert_direct_pin(&self, target: &Cid) -> Result<(), Error>;
@@ -249,6 +258,7 @@ impl From<Option<PinMode>> for PinModeRequirement {
     }
 }
 
+#[allow(dead_code)]
 impl PinModeRequirement {
     fn is_indirect_or_any(&self) -> bool {
         use PinModeRequirement::*;
@@ -301,12 +311,11 @@ pub enum PinKind<C: Borrow<Cid>> {
 
 impl<C: Borrow<Cid>> PinKind<C> {
     fn as_ref(&self) -> PinKind<&'_ Cid> {
-        use PinKind::*;
         match self {
-            IndirectFrom(c) => PinKind::IndirectFrom(c.borrow()),
-            Direct => PinKind::Direct,
-            Recursive(count) => PinKind::Recursive(*count),
-            RecursiveIntention => PinKind::RecursiveIntention,
+            PinKind::IndirectFrom(c) => PinKind::IndirectFrom(c.borrow()),
+            PinKind::Direct => PinKind::Direct,
+            PinKind::Recursive(count) => PinKind::Recursive(*count),
+            PinKind::RecursiveIntention => PinKind::RecursiveIntention,
         }
     }
 }
@@ -314,9 +323,7 @@ impl<C: Borrow<Cid>> PinKind<C> {
 type SubscriptionsMap = HashMap<Cid, Vec<futures::channel::oneshot::Sender<Result<Block, String>>>>;
 
 /// Describes a repo.
-///
 /// Consolidates a blockstore, a datastore and a subscription registry.
-
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -336,71 +343,16 @@ pub(crate) struct RepoInner {
     pub(crate) gclock: tokio::sync::RwLock<()>,
 }
 
-#[cfg(feature = "beetle_bitswap")]
-#[async_trait]
-impl beetle_bitswap_next::Store for Repo {
-    async fn get_size(&self, cid: &Cid) -> anyhow::Result<usize> {
-        self.get_block_now(cid)
-            .await?
-            .ok_or(anyhow::anyhow!("Block doesnt exist"))
-            .map(|block| block.data().len())
-    }
-    async fn get(&self, cid: &Cid) -> anyhow::Result<beetle_bitswap_next::Block> {
-        let block = self
-            .get_block_now(cid)
-            .await?
-            .ok_or(anyhow::anyhow!("Block doesnt exist"))?;
-        Ok(beetle_bitswap_next::Block {
-            cid: *block.cid(),
-            data: bytes::Bytes::copy_from_slice(block.data()),
-        })
-    }
-    async fn has(&self, cid: &Cid) -> anyhow::Result<bool> {
-        self.contains(cid).await
-    }
-}
-
-#[cfg(feature = "libp2p_bitswap")]
-#[async_trait]
-impl libp2p_bitswap_next::BitswapStore for Repo {
-    type Params = libipld::DefaultParams;
-
-    async fn contains(&mut self, cid: &Cid) -> anyhow::Result<bool> {
-        self.inner.block_store.contains(cid).await
-    }
-
-    async fn get(&mut self, cid: &Cid) -> anyhow::Result<Option<Vec<u8>>> {
-        self.inner
-            .block_store
-            .get(cid)
-            .await
-            .map(|block| block.map(|block| block.data().to_vec()))
-    }
-
-    async fn insert(&mut self, block: &libipld::Block<Self::Params>) -> anyhow::Result<()> {
-        self.put_block(block.clone()).await.map(|_| ())
-    }
-
-    async fn missing_blocks(&mut self, cid: &Cid) -> anyhow::Result<Vec<Cid>> {
-        let mut stack = vec![*cid];
-        let mut missing = vec![];
-        while let Some(cid) = stack.pop() {
-            if let Some(data) = self.get(&cid).await? {
-                let block = Block::new_unchecked(cid, data);
-                block.references(&mut stack)?;
-            } else {
-                missing.push(cid);
-            }
-        }
-        Ok(missing)
-    }
-}
-
 /// Events used to communicate to the swarm on repo changes.
 #[derive(Debug)]
 pub enum RepoEvent {
     /// Signals a desired block.
-    WantBlock(Option<u64>, Vec<Cid>, Vec<PeerId>),
+    WantBlock(
+        Vec<Cid>,
+        Vec<PeerId>,
+        Option<Duration>,
+        Option<HashMap<Cid, Vec<Arc<Notify>>>>,
+    ),
     /// Signals a desired block is no longer wanted.
     UnwantBlock(Cid),
     /// Signals the posession of a new block.
@@ -410,11 +362,14 @@ pub enum RepoEvent {
 }
 
 impl Repo {
-    pub fn new(repo_type: &mut StoragePath) -> Self {
+    pub fn new(repo_type: &mut StorageType) -> Self {
         match repo_type {
-            StoragePath::Memory => Repo::new_memory(),
-            StoragePath::Disk(path) => Repo::new_fs(path),
-            StoragePath::Custom {
+            StorageType::Memory => Repo::new_memory(),
+            #[cfg(not(target_arch = "wasm32"))]
+            StorageType::Disk(path) => Repo::new_fs(path),
+            #[cfg(target_arch = "wasm32")]
+            StorageType::IndexedDb { namespace } => Repo::new_idb(namespace.take()),
+            StorageType::Custom {
                 blockstore,
                 datastore,
                 lock,
@@ -448,6 +403,7 @@ impl Repo {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_fs(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let mut blockstore_path = path.clone();
@@ -458,12 +414,7 @@ impl Repo {
         lockfile_path.push("repo_lock");
 
         let block_store = Box::new(blockstore::flatfs::FsBlockStore::new(blockstore_path));
-        #[cfg(not(any(feature = "sled_data_store", feature = "redb_data_store")))]
         let data_store = Box::new(datastore::flatfs::FsDataStore::new(datastore_path));
-        #[cfg(feature = "sled_data_store")]
-        let data_store = Box::new(datastore::sled::SledDataStore::new(datastore_path));
-        #[cfg(feature = "redb_data_store")]
-        let data_store = Box::new(datastore::redb::RedbDataStore::new(datastore_path));
         let lockfile = Box::new(lock::FsLock::new(lockfile_path));
         Self::new_raw(block_store, data_store, lockfile)
     }
@@ -471,6 +422,14 @@ impl Repo {
     pub fn new_memory() -> Self {
         let block_store = Box::new(blockstore::memory::MemBlockStore::new(Default::default()));
         let data_store = Box::new(datastore::memory::MemDataStore::new(Default::default()));
+        let lockfile = Box::new(lock::MemLock);
+        Self::new_raw(block_store, data_store, lockfile)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new_idb(namespace: Option<String>) -> Self {
+        let block_store = Box::new(blockstore::idb::IdbBlockStore::new(namespace.clone()));
+        let data_store = Box::new(datastore::idb::IdbDataStore::new(namespace));
         let lockfile = Box::new(lock::MemLock);
         Self::new_raw(block_store, data_store, lockfile)
     }
@@ -492,7 +451,7 @@ impl Repo {
                 let mut stream = self.list_blocks().await;
                 while let Some(cid) = stream.next().await {
                     match self.get_block_now(&cid).await {
-                        Ok(Some(block)) => match repo.inner.block_store.put(block).await {
+                        Ok(Some(block)) => match repo.inner.block_store.put(&block).await {
                             Ok(_) => {}
                             Err(e) => error!("Error migrating {cid}: {e}"),
                         },
@@ -528,9 +487,11 @@ impl Repo {
                             continue;
                         }
                         PinMode::Recursive => {
-                            let block = match self.get_block_now(&cid).await.map(|block| {
-                                block.and_then(|block| block.decode::<IpldCodec, Ipld>().ok())
-                            }) {
+                            let block = match self
+                                .get_block_now(&cid)
+                                .await
+                                .map(|block| block.and_then(|block| block.to_ipld().ok()))
+                            {
                                 Ok(Some(block)) => block,
                                 Ok(None) => continue,
                                 Err(e) => {
@@ -614,82 +575,34 @@ impl Repo {
         // Dropping the guard (even though not strictly necessary to compile) to avoid potential
         // deadlocks if `block_store` or `data_store` were to try to access `Repo.lockfile`.
         {
-            log::debug!("Trying lockfile");
+            tracing::debug!("Trying lockfile");
             self.inner.lockfile.try_exclusive()?;
-            log::debug!("lockfile tried");
+            tracing::debug!("lockfile tried");
         }
 
-        let f1 = self.inner.block_store.init();
-        let f2 = self.inner.data_store.init();
-        let (r1, r2) = futures::future::join(f1, f2).await;
-        let init = &self.inner.initialized;
-        if r1.is_err() {
-            r1.map(|_| {
-                init.store(true, Ordering::SeqCst);
-            })
-        } else {
-            r2.map(|_| {
-                init.store(true, Ordering::SeqCst);
-            })
-        }
-    }
-
-    pub async fn open(&self) -> Result<(), Error> {
-        let f1 = self.inner.block_store.open();
-        let f2 = self.inner.data_store.open();
-        let (r1, r2) = futures::future::join(f1, f2).await;
-        if r1.is_err() {
-            r1
-        } else {
-            r2
-        }
+        self.inner.block_store.init().await?;
+        self.inner.data_store.init().await?;
+        self.inner.initialized.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Puts a block into the block store.
-    pub async fn put_block(&self, block: Block) -> Result<Cid, Error> {
-        let _guard = self.inner.gclock.read().await;
-        let (cid, res) = self.inner.block_store.put(block.clone()).await?;
-
-        if let BlockPut::NewBlock = res {
-            if let Some(mut event) = self.repo_channel() {
-                _ = event.send(RepoEvent::NewBlock(block.clone())).await;
-            }
-            let list = self.inner.subscriptions.lock().remove(&cid);
-            if let Some(mut list) = list {
-                for ch in list.drain(..) {
-                    let block = block.clone();
-                    let _ = ch.send(Ok(block));
-                }
-            }
-        }
-
-        Ok(cid)
+    pub fn put_block(&self, block: &Block) -> RepoPutBlock {
+        RepoPutBlock::new(self, block).broadcast_on_new_block(true)
     }
 
     /// Retrives a block from the block store, or starts fetching it from the network and awaits
     /// until it has been fetched.
     #[inline]
-    pub async fn get_block(
-        &self,
-        cid: &Cid,
-        peers: &[PeerId],
-        local_only: bool,
-    ) -> Result<Block, Error> {
-        self.get_block_with_session(None, cid, peers, local_only, None)
-            .await
+    pub fn get_block<C: Borrow<Cid>>(&self, cid: C) -> RepoGetBlock {
+        RepoGetBlock::new(self.clone(), cid)
     }
 
     /// Retrives a set of blocks from the block store, or starts fetching them from the network and awaits
     /// until it has been fetched.
     #[inline]
-    pub async fn get_blocks(
-        &self,
-        cids: &[Cid],
-        peers: &[PeerId],
-        local_only: bool,
-    ) -> Result<BoxStream<'static, Result<Block, Error>>, Error> {
-        self.get_blocks_with_session(None, cids, peers, local_only, None)
-            .await
+    pub fn get_blocks(&self, cids: impl IntoIterator<Item = impl Borrow<Cid>>) -> RepoGetBlocks {
+        RepoGetBlocks::new(self.clone()).blocks(cids)
     }
 
     /// Get the size of listed blocks
@@ -704,110 +617,15 @@ impl Repo {
         self.inner.block_store.total_size().await
     }
 
-    pub(crate) async fn get_blocks_with_session(
-        &self,
-        session: impl Into<Option<u64>>,
-        cids: &[Cid],
-        peers: &[PeerId],
-        local_only: bool,
-        timeout: impl Into<Option<Duration>>,
-    ) -> Result<BoxStream<'static, Result<Block, Error>>, Error> {
-        let timeout = timeout.into();
-        let _guard = self.inner.gclock.read().await;
-        let mut blocks = FuturesOrdered::new();
-        let mut missing = cids.to_vec();
-        for cid in cids {
-            match self.get_block_now(cid).await {
-                Ok(Some(block)) => {
-                    blocks.push_back(async { Ok(block) }.boxed());
-                    if let Some(index) = missing.iter().position(|c| c == cid) {
-                        missing.remove(index);
-                    }
-                }
-                Ok(None) | Err(_) => {}
-            }
-        }
-
-        if missing.is_empty() {
-            return Ok(blocks.boxed());
-        }
-
-        if local_only || !self.is_online() {
-            anyhow::bail!("Unable to locate missing blocks {missing:?}");
-        }
-
-        // sending only fails if no one is listening anymore
-        // and that is okay with us.
-
-        let mut events = self
-            .repo_channel()
-            .ok_or(anyhow::anyhow!("Channel is not available"))?;
-
-        for cid in &missing {
-            let cid = *cid;
-            let (tx, rx) = futures::channel::oneshot::channel();
-            self.inner
-                .subscriptions
-                .lock()
-                .entry(cid)
-                .or_default()
-                .push(tx);
-
-            let timeout = timeout.unwrap_or(Duration::from_secs(60));
-            let mut events = events.clone();
-            let task = async move {
-                let block = tokio::time::timeout(timeout, rx)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Timeout while resolving {cid}"))??
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok::<_, anyhow::Error>(block)
-            }
-            .map_err(move |e| {
-                _ = events.try_send(RepoEvent::UnwantBlock(cid));
-                e
-            })
-            .boxed();
-            blocks.push_back(task);
-        }
-
-        events
-            .send(RepoEvent::WantBlock(
-                session.into(),
-                missing,
-                peers.to_vec(),
-            ))
-            .await
-            .ok();
-
-        Ok(blocks.boxed())
-    }
-
-    pub(crate) async fn get_block_with_session(
-        &self,
-        session: impl Into<Option<u64>>,
-        cid: &Cid,
-        peers: &[PeerId],
-        local_only: bool,
-        timeout: impl Into<Option<Duration>>,
-    ) -> Result<Block, Error> {
-        let cids = vec![*cid];
-        let mut blocks = self
-            .get_blocks_with_session(session, &cids, peers, local_only, timeout)
-            .await?;
-
-        blocks
-            .next()
-            .await
-            .ok_or(anyhow::anyhow!("Unable to locate {} block", *cid))?
-    }
-
     /// Retrieves a block from the block store if it's available locally.
-    pub async fn get_block_now(&self, cid: &Cid) -> Result<Option<Block>, Error> {
+    pub async fn get_block_now<C: Borrow<Cid>>(&self, cid: C) -> Result<Option<Block>, Error> {
+        let cid = cid.borrow();
         self.inner.block_store.get(cid).await
     }
 
     /// Check to determine if blockstore contain a block
-    pub async fn contains(&self, cid: &Cid) -> Result<bool, Error> {
+    pub async fn contains<C: Borrow<Cid>>(&self, cid: C) -> Result<bool, Error> {
+        let cid = cid.borrow();
         self.inner.block_store.contains(cid).await
     }
 
@@ -817,16 +635,20 @@ impl Repo {
     }
 
     /// Remove block from the block store.
-    pub async fn remove_block(&self, cid: &Cid, recursive: bool) -> Result<Vec<Cid>, Error> {
+    pub async fn remove_block<C: Borrow<Cid>>(
+        &self,
+        cid: C,
+        recursive: bool,
+    ) -> Result<Vec<Cid>, Error> {
         let _guard = self.inner.gclock.read().await;
-
+        let cid = cid.borrow();
         if self.is_pinned(cid).await? {
             return Err(anyhow::anyhow!("block to remove is pinned"));
         }
 
         let list = match recursive {
             true => {
-                let mut list = self.recursive_collections(*cid).await?;
+                let mut list = self.recursive_collections(*cid).await;
                 // ensure the first root block is apart of the list
                 list.insert(*cid);
                 list
@@ -861,25 +683,27 @@ impl Repo {
         Ok(removed)
     }
 
-    fn recursive_collections(&self, cid: Cid) -> BoxFuture<'_, anyhow::Result<BTreeSet<Cid>>> {
+    fn recursive_collections(&self, cid: Cid) -> BoxFuture<'_, BTreeSet<Cid>> {
         async move {
-            let block = self
-                .get_block_now(&cid)
-                .await?
-                .ok_or(anyhow::anyhow!("Block does not exist"))?;
+            let block = match self.get_block_now(&cid).await {
+                Ok(Some(block)) => block,
+                _ => return BTreeSet::default(),
+            };
 
             let mut references: BTreeSet<Cid> = BTreeSet::new();
-            block.references(&mut references)?;
+            if block.references(&mut references).is_err() {
+                return BTreeSet::default();
+            }
 
             let mut list = BTreeSet::new();
 
             for cid in &references {
-                let mut inner_list = self.recursive_collections(*cid).await?;
+                let mut inner_list = self.recursive_collections(*cid).await;
                 list.append(&mut inner_list);
             }
 
             references.append(&mut list);
-            Ok(references)
+            references
         }
         .boxed()
     }
@@ -896,8 +720,8 @@ impl Repo {
     ///
     /// Recursively pinned Cids cannot be re-pinned non-recursively but non-recursively pinned Cids
     /// can be "upgraded to" being recursively pinned.
-    pub fn pin(&self, cid: &Cid) -> RepoInsertPin {
-        RepoInsertPin::new(self.clone(), *cid)
+    pub fn pin<C: Borrow<Cid>>(&self, cid: C) -> RepoInsertPin {
+        RepoInsertPin::new(self.clone(), cid)
     }
 
     /// Unpins a given Cid recursively or only directly.
@@ -906,12 +730,12 @@ impl Repo {
     ///
     /// Unpinning an indirectly pinned Cid is not possible other than through its recursively
     /// pinned tree roots.
-    pub fn remove_pin(&self, cid: &Cid) -> RepoRemovePin {
-        RepoRemovePin::new(self.clone(), *cid)
+    pub fn remove_pin<C: Borrow<Cid>>(&self, cid: C) -> RepoRemovePin {
+        RepoRemovePin::new(self.clone(), cid)
     }
 
-    pub fn fetch(&self, cid: &Cid) -> RepoFetch {
-        RepoFetch::new(self.clone(), *cid)
+    pub fn fetch<C: Borrow<Cid>>(&self, cid: C) -> RepoFetch {
+        RepoFetch::new(self.clone(), cid)
     }
 
     /// Pins a given Cid recursively or directly (non-recursively).
@@ -965,10 +789,16 @@ impl Repo {
         let repo = self.clone();
 
         let blocks = repo.list_blocks().await;
+        let pins = repo
+            .list_pins(None)
+            .await
+            .filter_map(|result| futures::future::ready(result.map(|(cid, _)| cid).ok()))
+            .collect::<Vec<_>>()
+            .await;
 
         let stream = async_stream::stream! {
             for await cid in blocks {
-                if repo.is_pinned(&cid).await.unwrap_or_default() {
+                if pins.contains(&cid) {
                     continue;
                 }
                 yield cid;
@@ -988,14 +818,15 @@ impl Repo {
     }
 
     /// Checks if a `Cid` is pinned.
-    pub async fn is_pinned(&self, cid: &Cid) -> Result<bool, Error> {
+    pub async fn is_pinned<C: Borrow<Cid>>(&self, cid: C) -> Result<bool, Error> {
+        let cid = cid.borrow();
         self.inner.data_store.is_pinned(cid).await
     }
 
     pub async fn list_pins(
         &self,
         mode: impl Into<Option<PinMode>>,
-    ) -> futures::stream::BoxStream<'static, Result<(Cid, PinMode), Error>> {
+    ) -> BoxStream<'static, Result<(Cid, PinMode), Error>> {
         let mode = mode.into();
         self.inner.data_store.list(mode).await
     }
@@ -1028,22 +859,341 @@ impl Repo {
     }
 }
 
+pub struct RepoGetBlock {
+    instance: RepoGetBlocks,
+}
+
+impl RepoGetBlock {
+    pub fn new(repo: Repo, cid: impl Borrow<Cid>) -> Self {
+        let instance = RepoGetBlocks::new(repo).block(cid);
+        Self { instance }
+    }
+
+    pub fn span(mut self, span: impl Borrow<Span>) -> Self {
+        self.instance = self.instance.span(span);
+        self
+    }
+
+    pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.instance = self.instance.timeout(timeout);
+        self
+    }
+
+    pub fn local(mut self) -> Self {
+        self.instance = self.instance.local();
+        self
+    }
+
+    pub fn set_local(mut self, local: bool) -> Self {
+        self.instance = self.instance.set_local(local);
+        self
+    }
+
+    /// Peer that may contain the block
+    pub fn provider(mut self, peer_id: PeerId) -> Self {
+        self.instance = self.instance.provider(peer_id);
+        self
+    }
+
+    /// List of peers that may contain the block
+    pub fn providers(mut self, providers: impl IntoIterator<Item = impl Borrow<PeerId>>) -> Self {
+        self.instance = self.instance.providers(providers);
+        self
+    }
+}
+
+impl Future for RepoGetBlock {
+    type Output = Result<Block, Error>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut self;
+        match futures::ready!(this.instance.poll_next_unpin(cx)) {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Ready(Err(anyhow::anyhow!("block does not exist"))),
+        }
+    }
+}
+
+pub struct RepoGetBlocks {
+    repo: Option<Repo>,
+    cids: IndexSet<Cid>,
+    providers: IndexSet<PeerId>,
+    local: bool,
+    span: Span,
+    timeout: Option<Duration>,
+    stream: Option<BoxStream<'static, Result<Block, Error>>>,
+}
+
+impl RepoGetBlocks {
+    pub fn new(repo: Repo) -> Self {
+        Self {
+            repo: Some(repo),
+            cids: IndexSet::new(),
+            providers: IndexSet::new(),
+            local: false,
+            span: Span::current(),
+            timeout: None,
+            stream: None,
+        }
+    }
+
+    pub fn blocks(mut self, cids: impl IntoIterator<Item = impl Borrow<Cid>>) -> Self {
+        self.cids.extend(cids.into_iter().map(|cid| *cid.borrow()));
+        self
+    }
+
+    pub fn block(self, cid: impl Borrow<Cid>) -> Self {
+        self.blocks([cid])
+    }
+
+    pub fn span(mut self, span: impl Borrow<Span>) -> Self {
+        let span = span.borrow();
+        self.span = span.clone();
+        self
+    }
+
+    pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.timeout = timeout.into();
+        self
+    }
+
+    pub fn local(mut self) -> Self {
+        self.local = true;
+        self
+    }
+
+    pub fn set_local(mut self, local: bool) -> Self {
+        self.local = local;
+        self
+    }
+
+    pub fn provider(self, peer_id: impl Borrow<PeerId>) -> Self {
+        self.providers([peer_id])
+    }
+
+    pub fn providers(mut self, providers: impl IntoIterator<Item = impl Borrow<PeerId>>) -> Self {
+        self.providers
+            .extend(providers.into_iter().map(|k| *k.borrow()));
+        self
+    }
+}
+
+impl Stream for RepoGetBlocks {
+    type Item = Result<Block, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.stream.is_none() && self.repo.is_none() {
+            return Poll::Ready(None);
+        }
+
+        let this = &mut *self;
+
+        loop {
+            match &mut this.stream {
+                Some(stream) => {
+                    let _g = this.span.enter();
+                    match futures::ready!(stream.poll_next_unpin(cx)) {
+                        Some(item) => return Poll::Ready(Some(item)),
+                        None => {
+                            this.stream.take();
+                            return Poll::Ready(None);
+                        }
+                    }
+                }
+                None => {
+                    let repo = this.repo.take().expect("valid repo instance");
+                    let providers = std::mem::take(&mut this.providers);
+                    let cids = std::mem::take(&mut this.cids);
+                    let local_only = this.local;
+                    let timeout = this.timeout;
+
+                    let st = async_stream::stream! {
+                        let _guard = repo.gc_guard().await;
+                        let mut missing: IndexSet<Cid> = cids.clone();
+                        for cid in &cids {
+                            if let Ok(Some(block)) = repo.get_block_now(cid).await {
+                                yield Ok(block);
+                                missing.shift_remove(cid);
+                            }
+                        }
+
+                        if missing.is_empty() {
+                            return;
+                        }
+
+                        if local_only || !repo.is_online() {
+                            yield Err(anyhow::anyhow!("Unable to locate missing blocks {missing:?}"));
+                            return;
+                        }
+
+                        let mut events = match repo.repo_channel() {
+                            Some(events) => events,
+                            None => {
+                                yield Err(anyhow::anyhow!("Channel is not available"));
+                                return;
+                            }
+                        };
+
+                        let mut notified: HashMap<Cid, Vec<_>> = HashMap::new();
+
+                        let timeout = timeout.or(Some(Duration::from_secs(60)));
+
+                        let mut blocks = FuturesOrdered::new();
+
+                        for cid in &missing {
+                            let cid = *cid;
+                            let (tx, rx) = futures::channel::oneshot::channel();
+                            repo.inner
+                                .subscriptions
+                                .lock()
+                                .entry(cid)
+                                .or_default()
+                                .push(tx);
+
+                            let mut events = events.clone();
+                            let signal = Arc::new(Notify::new());
+                            let s2 = signal.clone();
+                            let task = async move {
+                                let block_fut = rx;
+                                let notified_fut = signal.notified();
+                                futures::pin_mut!(notified_fut);
+
+                                match futures::future::select(block_fut, notified_fut).await {
+                                    Either::Left((Ok(Ok(block)), _)) => Ok::<_, Error>(block),
+                                    Either::Left((Ok(Err(e)), _)) => Err::<_, Error>(anyhow::anyhow!("{e}")),
+                                    Either::Left((Err(e), _)) => Err::<_, Error>(e.into()),
+                                    Either::Right(((), _)) => {
+                                        Err::<_, Error>(anyhow::anyhow!("request for {cid} has been cancelled"))
+                                    }
+                                }
+                            }
+                            .map_err(move |e| {
+                                // Although we request would eventually be cancelled if timeout or cancelled, we can still signal to swarm
+                                // about the block being unwanted for future changes.
+                                _ = events.try_send(RepoEvent::UnwantBlock(cid));
+                                e
+                            })
+                            .boxed();
+
+                            notified.entry(cid).or_default().push(s2);
+
+                            blocks.push_back(task);
+                        }
+
+                        events
+                            .send(RepoEvent::WantBlock(
+                                Vec::from_iter(missing),
+                                Vec::from_iter(providers),
+                                timeout,
+                                Some(notified),
+                            ))
+                            .await
+                            .ok();
+
+                        for await block in blocks {
+                            yield block
+                        }
+                    };
+
+                    this.stream.replace(Box::pin(st));
+                }
+            }
+        }
+    }
+}
+
+impl IntoFuture for RepoGetBlocks {
+    type Output = Result<Vec<Block>, Error>;
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+    fn into_future(self) -> Self::IntoFuture {
+        async move {
+            let col = self.try_collect().await?;
+            Ok(col)
+        }
+        .boxed()
+    }
+}
+
+pub struct RepoPutBlock {
+    repo: Repo,
+    block: Option<Block>,
+    span: Option<Span>,
+    broadcast_on_new_block: bool,
+}
+
+impl RepoPutBlock {
+    fn new(repo: &Repo, block: &Block) -> Self {
+        let block = Some(block.clone());
+        Self {
+            repo: repo.clone(),
+            block,
+            span: None,
+            broadcast_on_new_block: true,
+        }
+    }
+
+    pub fn broadcast_on_new_block(mut self, v: bool) -> Self {
+        self.broadcast_on_new_block = v;
+        self
+    }
+
+    pub fn span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+}
+
+impl IntoFuture for RepoPutBlock {
+    type IntoFuture = BoxFuture<'static, Self::Output>;
+    type Output = Result<Cid, Error>;
+    fn into_future(mut self) -> Self::IntoFuture {
+        let block = self.block.take().expect("valid block is set");
+        let span = self.span.unwrap_or(Span::current());
+        let span = debug_span!(parent: &span, "put_block", cid = %block.cid());
+        async move {
+            let _guard = self.repo.inner.gclock.read().await;
+            let (cid, res) = self.repo.inner.block_store.put(&block).await?;
+
+            if let BlockPut::NewBlock = res {
+                if self.broadcast_on_new_block {
+                    if let Some(mut event) = self.repo.repo_channel() {
+                        _ = event.send(RepoEvent::NewBlock(block.clone())).await;
+                    }
+                }
+                let list = self.repo.inner.subscriptions.lock().remove(&cid);
+                if let Some(mut list) = list {
+                    for ch in list.drain(..) {
+                        let block = block.clone();
+                        let _ = ch.send(Ok(block));
+                    }
+                }
+            }
+
+            Ok(cid)
+        }
+        .instrument(span)
+        .boxed()
+    }
+}
+
 pub struct RepoFetch {
     repo: Repo,
     cid: Cid,
     span: Option<Span>,
     providers: Vec<PeerId>,
     recursive: bool,
+    timeout: Option<Duration>,
     refs: crate::refs::IpldRefs,
 }
 
 impl RepoFetch {
-    pub fn new(repo: Repo, cid: Cid) -> Self {
+    pub fn new<C: Borrow<Cid>>(repo: Repo, cid: C) -> Self {
+        let cid = cid.borrow();
         Self {
             repo,
-            cid,
+            cid: *cid,
             recursive: false,
             providers: vec![],
+            timeout: None,
             refs: Default::default(),
             span: None,
         }
@@ -1057,15 +1207,15 @@ impl RepoFetch {
 
     /// Peer that may contain the block
     pub fn provider(mut self, peer_id: PeerId) -> Self {
-        self.providers.push(peer_id);
-        self.refs = self.refs.provider(peer_id);
+        if !self.providers.contains(&peer_id) {
+            self.providers.push(peer_id);
+        }
         self
     }
 
     /// List of peers that may contain the block
     pub fn providers(mut self, providers: &[PeerId]) -> Self {
         self.providers = providers.to_vec();
-        self.refs = self.refs.providers(providers);
         self
     }
 
@@ -1078,11 +1228,11 @@ impl RepoFetch {
     /// Duration to fetch the block from the network before
     /// timing out
     pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout.replace(duration);
         self.refs = self.refs.with_timeout(duration);
         self
     }
 
-    ///
     pub fn exit_on_error(mut self) -> Self {
         self.refs = self.refs.with_exit_on_error();
         self
@@ -1095,8 +1245,8 @@ impl RepoFetch {
     }
 }
 
-impl std::future::IntoFuture for RepoFetch {
-    type Output = Result<(), anyhow::Error>;
+impl IntoFuture for RepoFetch {
+    type Output = Result<(), Error>;
 
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
@@ -1107,19 +1257,25 @@ impl std::future::IntoFuture for RepoFetch {
         let repo = self.repo;
         let span = debug_span!(parent: &span, "fetch", cid = %cid, recursive);
         let providers = self.providers;
+        let timeout = self.timeout;
         async move {
             // Although getting a block adds a guard, we will add a read guard here a head of time so we can hold it throughout this future
             let _g = repo.inner.gclock.read().await;
-            let block = repo.get_block(&cid, &providers, false).await?;
+            let block = repo
+                .get_block(cid)
+                .providers(&providers)
+                .timeout(timeout)
+                .await?;
 
             if !recursive {
                 return Ok(());
             }
-            let ipld = block.decode::<IpldCodec, Ipld>()?;
+            let ipld = block.to_ipld()?;
 
             let mut st = self
                 .refs
                 .with_only_unique()
+                .providers(&providers)
                 .refs_of_resolved(&repo, vec![(cid, ipld.clone())])
                 .map_ok(|crate::refs::Edge { destination, .. }| destination)
                 .into_stream()
@@ -1138,18 +1294,23 @@ pub struct RepoInsertPin {
     repo: Repo,
     cid: Cid,
     span: Option<Span>,
+    providers: Vec<PeerId>,
     recursive: bool,
+    timeout: Option<Duration>,
     local: bool,
     refs: crate::refs::IpldRefs,
 }
 
 impl RepoInsertPin {
-    pub fn new(repo: Repo, cid: Cid) -> Self {
+    pub fn new<C: Borrow<Cid>>(repo: Repo, cid: C) -> Self {
+        let cid = cid.borrow();
         Self {
             repo,
-            cid,
+            cid: *cid,
             recursive: false,
+            providers: vec![],
             local: false,
+            timeout: None,
             refs: Default::default(),
             span: None,
         }
@@ -1177,6 +1338,20 @@ impl RepoInsertPin {
         self
     }
 
+    /// Peer that may contain the block to pin
+    pub fn provider(mut self, peer_id: PeerId) -> Self {
+        if !self.providers.contains(&peer_id) {
+            self.providers.push(peer_id);
+        }
+        self
+    }
+
+    /// List of peers that may contain the block to pin
+    pub fn providers(mut self, providers: &[PeerId]) -> Self {
+        self.providers = providers.into();
+        self
+    }
+
     /// Pin to a specific depth of the graph
     pub fn depth(mut self, depth: u64) -> Self {
         self.refs = self.refs.with_max_depth(depth);
@@ -1186,11 +1361,11 @@ impl RepoInsertPin {
     /// Duration to fetch the block from the network before
     /// timing out
     pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout.replace(duration);
         self.refs = self.refs.with_timeout(duration);
         self
     }
 
-    ///
     pub fn exit_on_error(mut self) -> Self {
         self.refs = self.refs.with_exit_on_error();
         self
@@ -1203,8 +1378,8 @@ impl RepoInsertPin {
     }
 }
 
-impl std::future::IntoFuture for RepoInsertPin {
-    type Output = Result<(), anyhow::Error>;
+impl IntoFuture for RepoInsertPin {
+    type Output = Result<(), Error>;
 
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
@@ -1215,19 +1390,27 @@ impl std::future::IntoFuture for RepoInsertPin {
         let recursive = self.recursive;
         let repo = self.repo;
         let span = debug_span!(parent: &span, "insert_pin", cid = %cid, recursive);
+        let providers = self.providers;
+        let timeout = self.timeout;
         async move {
             // Although getting a block adds a guard, we will add a read guard here a head of time so we can hold it throughout this future
             let _g = repo.inner.gclock.read().await;
-            let block = repo.get_block(&cid, &[], local).await?;
+            let block = repo
+                .get_block(cid)
+                .providers(&providers)
+                .set_local(local)
+                .timeout(timeout)
+                .await?;
 
             if !recursive {
                 repo.insert_direct_pin(&cid).await?
             } else {
-                let ipld = block.decode::<IpldCodec, Ipld>()?;
+                let ipld = block.to_ipld()?;
 
                 let st = self
                     .refs
                     .with_only_unique()
+                    .providers(&providers)
                     .refs_of_resolved(&repo, vec![(cid, ipld.clone())])
                     .map_ok(|crate::refs::Edge { destination, .. }| destination)
                     .into_stream()
@@ -1251,10 +1434,11 @@ pub struct RepoRemovePin {
 }
 
 impl RepoRemovePin {
-    pub fn new(repo: Repo, cid: Cid) -> Self {
+    pub fn new<C: Borrow<Cid>>(repo: Repo, cid: C) -> Self {
+        let cid = cid.borrow();
         Self {
             repo,
-            cid,
+            cid: *cid,
             recursive: false,
             refs: Default::default(),
             span: None,
@@ -1274,8 +1458,8 @@ impl RepoRemovePin {
     }
 }
 
-impl std::future::IntoFuture for RepoRemovePin {
-    type Output = Result<(), anyhow::Error>;
+impl IntoFuture for RepoRemovePin {
+    type Output = Result<(), Error>;
 
     type IntoFuture = BoxFuture<'static, Self::Output>;
 
@@ -1300,12 +1484,12 @@ impl std::future::IntoFuture for RepoRemovePin {
                     }
                 };
 
-                let ipld = block.decode::<IpldCodec, Ipld>()?;
+                let ipld = block.to_ipld()?;
                 let st = self
                     .refs
                     .with_only_unique()
                     .with_existing_blocks()
-                    .refs_of_resolved(&repo, vec![(cid, ipld.clone())])
+                    .refs_of_resolved(&repo, vec![(cid, ipld)])
                     .map_ok(|crate::refs::Edge { destination, .. }| destination)
                     .into_stream()
                     .boxed();

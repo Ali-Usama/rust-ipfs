@@ -6,22 +6,21 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/dariusc93/rust-ipfs"
 description = "Rust implementation of IPNS"
-version = "0.5.0"
+version = "0.7.0"
 authors = ["Darius Clark"]
 keywords = ["libp2p", "ipfs"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cbor4ii = { version = "0.3", features = ["serde1"] }
-quick-protobuf = "0.8"
-cid = "0.10"
-serde = { version = "1", features = ["derive"] }
-multihash = { version = "0.18" }
-sha2 = { version = "0.10" }
-chrono = { version = "0.4.35" }
+cbor4ii = { version = "1.0.0", features = ["serde1"] }
+quick-protobuf.workspace = true
+cid.workspace = true
+serde = { workspace = true, features = ["derive"] }
+multihash.workspace = true
+chrono.workspace = true
 
-libp2p-identity = { version = "0.2", optional = true, features = [
+libp2p-identity = { version = "0.2.10", optional = true, features = [
     "ecdsa",
     "ed25519",
     "peerid",
@@ -29,9 +28,12 @@ libp2p-identity = { version = "0.2", optional = true, features = [
     "rsa",
     "secp256k1",
 ] }
-derive_more = "0.99"
+derive_more = { version = "1.0.0", features = ["full"] }
 
-[dev-dependencies]
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 clap = { workspace = true, features = ["derive"] }
 
 [features]

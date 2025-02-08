@@ -1,7 +1,6 @@
-use libipld::ipld;
-use rust_ipfs::IpfsPath;
+use ipld_core::ipld;
 
-use rust_ipfs::UninitializedIpfsNoop as UninitializedIpfs;
+use rust_ipfs::UninitializedIpfsDefault as UninitializedIpfs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,20 +23,16 @@ async fn main() -> anyhow::Result<()> {
 
     let addrs = node_a.listening_addresses().await?;
 
-    for addr in addrs {
-        node_b.add_peer(peer_id, addr).await?;
-    }
-
-    node_b.connect(peer_id).await?;
+    node_b.add_peer((peer_id, addrs)).await?;
 
     let block_a = ipld!({
         "name": "alice",
         "age": 99,
     });
 
-    let cid = node_a.put_dag(block_a.clone()).await?;
+    let cid = node_a.put_dag(&block_a).await?;
 
-    let block_b = node_b.get_dag(IpfsPath::from(cid)).await?;
+    let block_b = node_b.get_dag(cid).await?;
 
     assert_eq!(block_b, block_a);
 

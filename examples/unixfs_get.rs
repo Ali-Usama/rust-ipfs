@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use futures::StreamExt;
 
-use rust_ipfs::UninitializedIpfsNoop as UninitializedIpfs;
+use rust_ipfs::UninitializedIpfsDefault as UninitializedIpfs;
 use rust_ipfs::{unixfs::UnixfsStatus, Ipfs, IpfsPath, Multiaddr};
 
 #[derive(Debug, Parser)]
@@ -61,11 +61,7 @@ async fn main() -> anyhow::Result<()> {
                     None => println!("failed with {written} written"),
                 }
 
-                if let Some(error) = error {
-                    anyhow::bail!(error);
-                } else {
-                    anyhow::bail!("Unknown error while writting to disk");
-                }
+                anyhow::bail!(error);
             }
             UnixfsStatus::CompletedStatus { written, .. } => {
                 let path = dest;

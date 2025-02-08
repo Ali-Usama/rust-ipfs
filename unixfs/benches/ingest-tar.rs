@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use libipld::multihash::Multihash;
+use multihash::Multihash;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     let file = "benchmark.tar";
@@ -23,7 +23,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 }
 
 fn ingest_tar(bytes: &[u8], buffer: &mut Vec<u8>, path: &mut String) {
-    use libipld::Cid;
+    use ipld_core::cid::Cid;
     use rust_unixfs::dir::builder::{BufferingTreeBuilder, TreeOptions};
     use rust_unixfs::file::adder::FileAdder;
     use sha2::{Digest, Sha256};
@@ -53,8 +53,9 @@ fn ingest_tar(bytes: &[u8], buffer: &mut Vec<u8>, path: &mut String) {
 
             let len = buffer.len();
 
+            #[allow(clippy::needless_borrows_for_generic_args)]
             let mh = Multihash::wrap(
-                libipld::multihash::Code::Sha2_256.into(),
+                multihash_codetable::Code::Sha2_256.into(),
                 &Sha256::digest(&buffer),
             )
             .unwrap();

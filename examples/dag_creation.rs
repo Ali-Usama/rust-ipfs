@@ -1,20 +1,17 @@
-use libipld::ipld;
+use ipld_core::ipld;
 use rust_ipfs::{Ipfs, IpfsPath};
 
-use rust_ipfs::UninitializedIpfsNoop as UninitializedIpfs;
+use rust_ipfs::UninitializedIpfsDefault as UninitializedIpfs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Initialize the repo and start a daemon
-    let ipfs: Ipfs = UninitializedIpfs::new()
-        .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
-        .start()
-        .await?;
+    let ipfs: Ipfs = UninitializedIpfs::new().start().await?;
 
     // Create a DAG
-    let cid1: libipld::cid::CidGeneric<64> = ipfs.put_dag(ipld!("block1")).await?;
+    let cid1 = ipfs.put_dag(ipld!("block1")).await?;
     let cid2 = ipfs.put_dag(ipld!("block2")).await?;
     let root = ipld!([cid1, cid2]);
     let cid = ipfs.put_dag(root).await?;

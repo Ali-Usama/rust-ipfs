@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use futures::StreamExt;
-use rust_ipfs::UninitializedIpfsNoop as UninitializedIpfs;
+use rust_ipfs::UninitializedIpfsDefault as UninitializedIpfs;
 use rust_ipfs::{unixfs::UnixfsStatus, Ipfs};
 
 #[derive(Debug, Parser)]
@@ -45,11 +45,7 @@ async fn main() -> anyhow::Result<()> {
                     None => println!("failed with {written} stored"),
                 }
 
-                if let Some(error) = error {
-                    anyhow::bail!(error);
-                } else {
-                    anyhow::bail!("Unknown error while writting to blockstore");
-                }
+                anyhow::bail!(error);
             }
             UnixfsStatus::CompletedStatus { path, written, .. } => {
                 println!("{written} been stored with path {path}");

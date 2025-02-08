@@ -3,6 +3,7 @@
 //! Adding files and directory structures is supported but not exposed via an API. See examples and
 //! `ipfs-http`.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use anyhow::Error;
@@ -11,7 +12,7 @@ use futures::{
     stream::{self, BoxStream},
     StreamExt,
 };
-use libipld::Cid;
+use ipld_core::cid::Cid;
 use ll::file::FileReadFailed;
 pub use rust_unixfs as ll;
 
@@ -34,29 +35,34 @@ pub struct IpfsUnixfs {
 }
 
 pub enum AddOpt {
+    #[cfg(not(target_arch = "wasm32"))]
     Path(PathBuf),
     Stream(BoxStream<'static, std::io::Result<Bytes>>),
     StreamWithName(String, BoxStream<'static, std::io::Result<Bytes>>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<&str> for AddOpt {
     fn from(value: &str) -> Self {
         AddOpt::Path(PathBuf::from(value))
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<String> for AddOpt {
     fn from(value: String) -> Self {
         AddOpt::Path(PathBuf::from(value))
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<&std::path::Path> for AddOpt {
     fn from(path: &std::path::Path) -> Self {
         AddOpt::Path(path.to_path_buf())
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<PathBuf> for AddOpt {
     fn from(path: PathBuf) -> Self {
         AddOpt::Path(path)
@@ -70,8 +76,22 @@ impl From<Vec<u8>> for AddOpt {
     }
 }
 
+impl From<&'static [u8]> for AddOpt {
+    fn from(bytes: &'static [u8]) -> Self {
+        let bytes: Bytes = bytes.into();
+        Self::from(bytes)
+    }
+}
+
 impl From<(String, Vec<u8>)> for AddOpt {
     fn from((name, bytes): (String, Vec<u8>)) -> Self {
+        let bytes: Bytes = bytes.into();
+        Self::from((name, bytes))
+    }
+}
+
+impl From<(String, &'static [u8])> for AddOpt {
+    fn from((name, bytes): (String, &'static [u8])) -> Self {
         let bytes: Bytes = bytes.into();
         Self::from((name, bytes))
     }
@@ -129,9 +149,10 @@ impl IpfsUnixfs {
     }
 
     /// Add a file from either a file or stream
-    pub fn add<I: Into<AddOpt>>(&self, item: I) -> UnixfsAdd {
+    pub fn add(&self, item: impl Into<AddOpt>) -> UnixfsAdd {
         let item = item.into();
         match item {
+            #[cfg(not(target_arch = "wasm32"))]
             AddOpt::Path(path) => UnixfsAdd::with_ipfs(&self.ipfs, path),
             AddOpt::Stream(stream) => UnixfsAdd::with_ipfs(
                 &self.ipfs,
@@ -155,12 +176,12 @@ impl IpfsUnixfs {
     /// Retreive a file and saving it to a local path.
     ///
     /// To create an owned version of the stream, please use `ipfs::unixfs::get` directly.
-    pub fn get<P: AsRef<std::path::Path>>(&self, path: IpfsPath, dest: P) -> UnixfsGet {
+    pub fn get(&self, path: impl Into<IpfsPath>, dest: impl AsRef<std::path::Path>) -> UnixfsGet {
         UnixfsGet::with_ipfs(&self.ipfs, path, dest)
     }
 
     /// List directory contents
-    pub fn ls(&self, path: IpfsPath) -> UnixfsLs {
+    pub fn ls(&self, path: impl Into<IpfsPath>) -> UnixfsLs {
         UnixfsLs::with_ipfs(&self.ipfs, path)
     }
 }
@@ -179,16 +200,8 @@ pub enum UnixfsStatus {
     FailedStatus {
         written: usize,
         total_size: Option<usize>,
-        error: Option<anyhow::Error>,
+        error: Error,
     },
-}
-
-pub(crate) enum StatusStreamState {
-    None,
-    Pending {
-        stream: BoxStream<'static, UnixfsStatus>,
-    },
-    Done,
 }
 
 /// Types of failures which can occur while walking the UnixFS graph.
@@ -207,6 +220,8 @@ pub enum TraversalFailed {
     #[error("loading of {} failed", .0)]
     Loading(Cid, #[source] Error),
 
+    #[error("data exceeded max length")]
+    MaxLengthExceeded { size: usize, length: usize },
     #[error("Timeout while resolving {path}")]
     Timeout { path: IpfsPath },
 

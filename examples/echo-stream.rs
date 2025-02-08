@@ -8,7 +8,9 @@ async fn main() -> anyhow::Result<()> {
     use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
     use libp2p::{Multiaddr, PeerId, StreamProtocol};
     use rand::RngCore;
-    use rust_ipfs::{p2p::MultiaddrExt, Ipfs, Keypair, UninitializedIpfsNoop as UninitializedIpfs};
+    use rust_ipfs::{
+        p2p::MultiaddrExt, Ipfs, Keypair, UninitializedIpfsDefault as UninitializedIpfs,
+    };
 
     #[derive(Debug, Parser)]
     #[clap(name = "stream")]
@@ -27,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize the repo and start a daemon
     let ipfs = UninitializedIpfs::new()
         .set_keypair(&keypair)
-        .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
+        .add_listening_addr("/ip4/127.0.0.1/tcp/0".parse()?)
         .with_streams()
         .start()
         .await?;

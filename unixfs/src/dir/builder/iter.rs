@@ -2,8 +2,9 @@ use super::{
     CustomFlatUnixFs, DirBuilder, Entry, Leaf, NamedLeaf, TreeConstructionFailed, TreeOptions,
 };
 use core::fmt;
-use libipld::multihash::{Code, Multihash};
-use libipld::Cid;
+use ipld_core::cid::Cid;
+use multihash::Multihash;
+use multihash_codetable::Code;
 use std::collections::HashMap;
 
 /// Constructs the directory nodes required for a tree.
@@ -142,6 +143,7 @@ impl PostOrderIterator {
 
         buffer.truncate(size);
 
+        #[allow(clippy::needless_borrows_for_generic_args)]
         let mh = Multihash::wrap(Code::Sha2_256.into(), &Sha256::digest(&buffer)).unwrap();
         let cid = Cid::new_v0(mh).expect("sha2_256 is the correct multihash for cidv0");
 
@@ -320,7 +322,7 @@ pub struct TreeNode<'a> {
     pub block: &'a [u8],
 }
 
-impl<'a> fmt::Debug for TreeNode<'a> {
+impl fmt::Debug for TreeNode<'_> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("TreeNode")
             .field("path", &format_args!("{:?}", self.path))

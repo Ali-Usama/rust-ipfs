@@ -6,7 +6,7 @@ use futures::{
     stream::{BoxStream, FusedStream},
     FutureExt, Stream, StreamExt,
 };
-use libipld::Cid;
+use ipld_core::cid::Cid;
 use libp2p::PeerId;
 use rust_unixfs::walk::{ContinuedWalk, Walker};
 use tracing::{Instrument, Span};
@@ -21,7 +21,7 @@ pub enum Entry {
     File { cid: Cid, file: String, size: usize },
 }
 
-#[must_use = "do nothing unless you `.await` or poll the stream"]
+#[must_use = "does nothing unless you `.await` or poll the stream"]
 pub struct UnixfsLs {
     core: Option<Either<Ipfs, Repo>>,
     span: Span,
@@ -67,7 +67,7 @@ impl UnixfsLs {
     }
 
     pub fn providers(mut self, list: &[PeerId]) -> Self {
-        self.providers = list.to_owned();
+        self.providers = list.to_vec();
         self
     }
 
@@ -92,7 +92,10 @@ impl Stream for UnixfsLs {
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
+        if self.core.is_none() && self.stream.is_none() {
+            return Poll::Ready(None);
+        }
         loop {
             match &mut self.stream {
                 Some(stream) => match futures::ready!(stream.poll_next_unpin(cx)) {
@@ -107,20 +110,9 @@ impl Stream for UnixfsLs {
                         return Poll::Ready(None);
                     };
 
-                    let (repo, dag, session) = match core {
-                        Either::Left(ipfs) => (
-                            ipfs.repo().clone(),
-                            ipfs.dag(),
-                            Some(
-                                crate::BITSWAP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                            ),
-                        ),
-                        Either::Right(repo) => {
-                            let session = repo.is_online().then(|| {
-                                crate::BITSWAP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            });
-                            (repo.clone(), IpldDag::from(repo.clone()), session)
-                        }
+                    let (repo, dag) = match core {
+                        Either::Left(ipfs) => (ipfs.repo().clone(), ipfs.dag()),
+                        Either::Right(repo) => (repo.clone(), IpldDag::from(repo.clone())),
                     };
 
                     let path = self.path.take().expect("path exist");
@@ -133,7 +125,7 @@ impl Stream for UnixfsLs {
                     let stream = async_stream::stream! {
 
                         let resolved = match dag
-                            .resolve_with_session(session, path, true, &providers, local_only, timeout)
+                            ._resolve(path, true, &providers, local_only, timeout)
                             .await {
                                 Ok((resolved, _)) => resolved,
                                 Err(e) => {
@@ -158,7 +150,7 @@ impl Stream for UnixfsLs {
                         let mut root_directory = String::new();
                         while walker.should_continue() {
                             let (next, _) = walker.pending_links();
-                            let block = match repo.get_block_with_session(session, next, &providers, local_only, timeout).await {
+                            let block = match repo.get_block(next).providers(&providers).set_local(local_only).timeout(timeout).await {
                                 Ok(block) => block,
                                 Err(error) => {
                                     yield Entry::Error { error };
@@ -175,7 +167,7 @@ impl Stream for UnixfsLs {
                                 },
                                 Ok(ContinuedWalk::RootDirectory( cid, path, _)) => {
                                     let path = path.to_string_lossy().to_string();
-                                    root_directory = path.clone();
+                                    root_directory.clone_from(&path);
                                     yield Entry::RootDirectory { cid: *cid, path };
                                 }
                                 Ok(ContinuedWalk::Directory( cid, path, _)) => {

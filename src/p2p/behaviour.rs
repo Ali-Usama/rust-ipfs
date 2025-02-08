@@ -1,28 +1,19 @@
 use super::gossipsub::GossipsubStream;
-use super::{addressbook, protocol};
-#[cfg(feature = "beetle_bitswap")]
-use bytes::Bytes;
+use super::{addressbook, protocol, request_response, rr_man};
 
+use indexmap::IndexMap;
 use libp2p_allow_block_list::BlockedPeers;
-#[cfg(feature = "libp2p_bitswap")]
-use libp2p_bitswap_next::Bitswap;
 
 use super::peerbook::{self};
 use either::Either;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
-use crate::IpfsOptions;
+use crate::{IntoAddPeerOpt, IpfsOptions};
 
-use crate::p2p::MultiaddrExt;
 use crate::repo::Repo;
-#[cfg(feature = "beetle_bitswap")]
-use beetle_bitswap_next::{Bitswap, ProtocolId};
 
-#[cfg(feature = "libp2p_bitswap")]
-use libipld::DefaultParams;
-
-use libipld::Cid;
+use ipld_core::cid::Cid;
 use libp2p::core::Multiaddr;
 use libp2p::dcutr::Behaviour as Dcutr;
 use libp2p::identify::{Behaviour as Identify, Config as IdentifyConfig};
@@ -32,6 +23,7 @@ use libp2p::kad::{
     Behaviour as Kademlia, BucketInserts as KademliaBucketInserts, Config as KademliaConfig,
     Record, StoreInserts as KademliaStoreInserts,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use libp2p::mdns::tokio::Behaviour as Mdns;
 use libp2p::ping::Behaviour as Ping;
 use libp2p::relay::client::Behaviour as RelayClient;
@@ -40,7 +32,6 @@ use libp2p::relay::Behaviour as Relay;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{autonat, StreamProtocol};
-use std::borrow::Cow;
 use std::fmt::Debug;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
@@ -52,32 +43,56 @@ where
     C: NetworkBehaviour,
     <C as NetworkBehaviour>::ToSwarm: Debug + Send,
 {
-    pub mdns: Toggle<Mdns>,
-    #[cfg(feature = "libp2p_bitswap")]
-    pub bitswap: Toggle<Bitswap<DefaultParams>>,
-    #[cfg(feature = "beetle_bitswap")]
-    pub bitswap: Toggle<Bitswap<Repo>>,
-    #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
-    pub bitswap: Toggle<super::bitswap::Behaviour>,
-    pub kademlia: Toggle<Kademlia<MemoryStore>>,
-    pub ping: Toggle<Ping>,
-    pub identify: Toggle<Identify>,
-    pub pubsub: Toggle<GossipsubStream>,
-    pub autonat: Toggle<autonat::Behaviour>,
-    pub upnp: Toggle<libp2p::upnp::tokio::Behaviour>,
+    // connection management
+    //TODO: Maybe have a optiont to enable a whitelist?
     pub block_list: libp2p_allow_block_list::Behaviour<BlockedPeers>,
+    pub connection_limits: Toggle<libp2p_connection_limits::Behaviour>,
+    pub addressbook: addressbook::Behaviour,
+
+    // networking
     pub relay: Toggle<Relay>,
     pub relay_client: Toggle<RelayClient>,
     pub relay_manager: Toggle<libp2p_relay_manager::Behaviour>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub upnp: Toggle<libp2p::upnp::tokio::Behaviour>,
+    pub dcutr: Toggle<Dcutr>,
+
+    // discovery
     pub rendezvous_client: Toggle<libp2p::rendezvous::client::Behaviour>,
     pub rendezvous_server: Toggle<libp2p::rendezvous::server::Behaviour>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub mdns: Toggle<Mdns>,
+    pub kademlia: Toggle<Kademlia<MemoryStore>>,
+
+    // messaging
+    pub identify: Toggle<Identify>,
+    pub pubsub: Toggle<GossipsubStream>,
+    pub bitswap: Toggle<super::bitswap::Behaviour>,
+    pub ping: Toggle<Ping>,
     #[cfg(feature = "experimental_stream")]
     pub stream: Toggle<libp2p_stream::Behaviour>,
-    pub dcutr: Toggle<Dcutr>,
-    pub addressbook: addressbook::Behaviour,
+
+    pub autonat: Toggle<autonat::Behaviour>,
+
+    // TODO: Write a macro or behaviour to support multiple request-response behaviour
+    pub rr_man: Toggle<rr_man::Behaviour>,
+    pub rr_1: Toggle<request_response::Behaviour>,
+    pub rr_2: Toggle<request_response::Behaviour>,
+    pub rr_3: Toggle<request_response::Behaviour>,
+    pub rr_4: Toggle<request_response::Behaviour>,
+    pub rr_5: Toggle<request_response::Behaviour>,
+    pub rr_6: Toggle<request_response::Behaviour>,
+    pub rr_7: Toggle<request_response::Behaviour>,
+    pub rr_8: Toggle<request_response::Behaviour>,
+    pub rr_9: Toggle<request_response::Behaviour>,
+    pub rr_0: Toggle<request_response::Behaviour>,
+
+    // custom behaviours
+    pub custom: Toggle<C>,
+
+    // misc
     pub peerbook: peerbook::Behaviour,
     pub protocol: protocol::Behaviour,
-    pub custom: Toggle<C>,
 }
 
 /// Represents the result of a Kademlia query.
@@ -89,7 +104,6 @@ pub enum KadResult {
     Peers(Vec<PeerId>),
     /// The query successfully returns a `GetRecord` result.
     Records(Vec<Record>),
-    ///
     Record(Record),
 }
 
@@ -97,12 +111,12 @@ pub enum KadResult {
 pub struct RelayConfig {
     pub max_reservations: usize,
     pub max_reservations_per_peer: usize,
-    pub reservation_duration: std::time::Duration,
+    pub reservation_duration: Duration,
     pub reservation_rate_limiters: Vec<RateLimit>,
 
     pub max_circuits: usize,
     pub max_circuits_per_peer: usize,
-    pub max_circuit_duration: std::time::Duration,
+    pub max_circuit_duration: Duration,
     pub max_circuit_bytes: u64,
     pub circuit_src_rate_limiters: Vec<RateLimit>,
 }
@@ -138,6 +152,23 @@ impl Default for RelayConfig {
                     interval: Duration::from_secs(60),
                 },
             ],
+        }
+    }
+}
+
+impl RelayConfig {
+    /// Configuration to allow a connection to the relay without limits
+    pub fn unbounded() -> Self {
+        Self {
+            max_circuits: usize::MAX,
+            max_circuit_bytes: u64::MAX,
+            max_circuit_duration: Duration::MAX,
+            max_circuits_per_peer: usize::MAX,
+            max_reservations: usize::MAX,
+            reservation_duration: Duration::MAX,
+            max_reservations_per_peer: usize::MAX,
+            reservation_rate_limiters: vec![],
+            circuit_src_rate_limiters: vec![],
         }
     }
 }
@@ -187,6 +218,9 @@ impl From<RelayConfig> for libp2p::relay::Config {
             circuit_src_rate_limiters,
         }: RelayConfig,
     ) -> Self {
+        let reservation_duration = max_duration(reservation_duration);
+        let max_circuit_duration = max_duration(max_circuit_duration);
+
         let mut config = libp2p::relay::Config {
             max_reservations,
             max_reservations_per_peer,
@@ -224,6 +258,14 @@ impl From<RelayConfig> for libp2p::relay::Config {
     }
 }
 
+fn max_duration(duration: Duration) -> Duration {
+    let start = web_time::Instant::now();
+    if start.checked_add(duration).is_none() {
+        return Duration::from_secs(u32::MAX as _);
+    }
+    duration
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum RateLimit {
     PerPeer {
@@ -242,7 +284,7 @@ pub struct KadStoreConfig {
 }
 #[derive(Clone, Debug)]
 pub struct KadConfig {
-    pub protocol: Option<Vec<Cow<'static, str>>>,
+    pub protocol: Option<String>,
     pub disjoint_query_paths: bool,
     pub query_timeout: Duration,
     pub parallelism: Option<NonZeroUsize>,
@@ -250,6 +292,7 @@ pub struct KadConfig {
     pub provider_record_ttl: Option<Duration>,
     pub insert_method: KadInserts,
     pub store_filter: KadStoreInserts,
+    pub automatic_bootstrap: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -286,14 +329,10 @@ impl From<KadInserts> for KademliaBucketInserts {
 
 impl From<KadConfig> for KademliaConfig {
     fn from(config: KadConfig) -> Self {
-        let mut kad_config = KademliaConfig::default();
-        if let Some(protocol) = config.protocol.map(|list| {
-            list.iter()
-                .filter_map(|p| StreamProtocol::try_from_owned(p.to_string()).ok())
-                .collect()
-        }) {
-            kad_config.set_protocol_names(protocol);
-        }
+        let protocol = config.protocol.unwrap_or("/ipfs/kad/1.0.0".to_string());
+        let protocol = StreamProtocol::try_from_owned(protocol).expect("protocol to be valid");
+
+        let mut kad_config = KademliaConfig::new(protocol);
         kad_config.disjoint_query_paths(config.disjoint_query_paths);
         kad_config.set_query_timeout(config.query_timeout);
         if let Some(p) = config.parallelism {
@@ -303,6 +342,7 @@ impl From<KadConfig> for KademliaConfig {
         kad_config.set_provider_record_ttl(config.provider_record_ttl);
         kad_config.set_kbucket_inserts(config.insert_method.into());
         kad_config.set_record_filtering(config.store_filter.into());
+        kad_config.set_periodic_bootstrap_interval(config.automatic_bootstrap);
         kad_config
     }
 }
@@ -318,67 +358,7 @@ impl Default for KadConfig {
             publication_interval: None,
             insert_method: Default::default(),
             store_filter: Default::default(),
-        }
-    }
-}
-
-#[cfg(feature = "beetle_bitswap")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BitswapConfig {
-    protocol: Vec<BitswapProtocol>,
-    max_buf_size: Option<usize>,
-    server: bool,
-}
-
-#[cfg(feature = "beetle_bitswap")]
-impl Default for BitswapConfig {
-    fn default() -> Self {
-        Self {
-            protocol: vec![
-                BitswapProtocol::ProtocolLegacy,
-                BitswapProtocol::Protocol100,
-                BitswapProtocol::Protocol110,
-                BitswapProtocol::Protocol120,
-            ],
-            max_buf_size: None,
-            server: true,
-        }
-    }
-}
-
-#[cfg(feature = "beetle_bitswap")]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
-pub enum BitswapProtocol {
-    ProtocolLegacy,
-    Protocol100,
-    Protocol110,
-    #[default]
-    Protocol120,
-}
-
-#[cfg(feature = "beetle_bitswap")]
-impl From<BitswapProtocol> for ProtocolId {
-    fn from(value: BitswapProtocol) -> Self {
-        match value {
-            BitswapProtocol::ProtocolLegacy => ProtocolId::Legacy,
-            BitswapProtocol::Protocol100 => ProtocolId::Bitswap100,
-            BitswapProtocol::Protocol110 => ProtocolId::Bitswap110,
-            BitswapProtocol::Protocol120 => ProtocolId::Bitswap120,
-        }
-    }
-}
-
-#[cfg(feature = "beetle_bitswap")]
-impl From<BitswapConfig> for beetle_bitswap_next::Config {
-    fn from(value: BitswapConfig) -> Self {
-        beetle_bitswap_next::Config {
-            client: Default::default(),
-            server: value.server.then(Default::default),
-            protocol: beetle_bitswap_next::ProtocolConfig {
-                protocol_ids: value.protocol.iter().map(|proto| (*proto).into()).collect(),
-                max_transmit_size: value.max_buf_size.unwrap_or(1024 * 1024 * 2),
-            },
-            ..Default::default()
+            automatic_bootstrap: None,
         }
     }
 }
@@ -388,24 +368,27 @@ where
     C: NetworkBehaviour,
     <C as NetworkBehaviour>::ToSwarm: Debug + Send,
 {
-    pub async fn new(
+    pub(crate) fn new(
         keypair: &Keypair,
         options: &IpfsOptions,
         repo: &Repo,
         custom: Option<C>,
     ) -> Result<(Self, Option<ClientTransport>), Error> {
+        let bootstrap = options.bootstrap.clone();
+
         let protocols = options.protocols;
 
         let peer_id = keypair.public().to_peer_id();
 
         info!("net: starting with peer id {}", peer_id);
 
-        let mdns = if protocols.mdns {
-            Mdns::new(Default::default(), peer_id).ok()
-        } else {
-            None
-        }
-        .into();
+        // TODO: Do we want to ignore the protocol if there is an error from Mdns::new?
+        #[cfg(not(target_arch = "wasm32"))]
+        let mdns = protocols
+            .mdns
+            .then(|| Mdns::new(Default::default(), peer_id).ok())
+            .flatten()
+            .into();
 
         let store = {
             //TODO: Make customizable
@@ -420,46 +403,15 @@ where
             Either::Right(kad) => kad,
         };
 
-        let mut kademlia: Toggle<Kademlia<MemoryStore>> = Toggle::from(
-            (protocols.kad).then(|| Kademlia::with_config(peer_id, store, kad_config)),
-        );
-
-        if let Some(kad) = kademlia.as_mut() {
-            for mut addr in options.bootstrap.clone() {
-                let Some(peer_id) = addr.extract_peer_id() else {
-                    continue;
-                };
-                kad.add_address(&peer_id, addr);
-            }
-        }
+        let kademlia: Toggle<Kademlia<MemoryStore>> = (protocols.kad)
+            .then(|| Kademlia::with_config(peer_id, store, kad_config))
+            .into();
 
         let autonat = protocols
             .autonat
             .then(|| autonat::Behaviour::new(peer_id, Default::default()))
             .into();
 
-        #[cfg(feature = "beetle_bitswap")]
-        let bitswap = match protocols.bitswap {
-            true => Some(Bitswap::new(peer_id, repo.clone(), Default::default()).await),
-            false => None,
-        }
-        .into();
-
-        #[cfg(feature = "libp2p_bitswap")]
-        let bitswap = protocols
-            .bitswap
-            .then(|| {
-                Bitswap::new(
-                    Default::default(),
-                    repo.clone(),
-                    Box::new(|fut| {
-                        tokio::spawn(fut);
-                    }),
-                )
-            })
-            .into();
-
-        #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
         let bitswap = protocols
             .bitswap
             .then(|| super::bitswap::Behaviour::new(repo))
@@ -513,16 +465,19 @@ where
         };
 
         // Maybe have this enable in conjunction with RelayClient?
-        let dcutr = Toggle::from(protocols.dcutr.then(|| Dcutr::new(peer_id)));
+        let dcutr = protocols.dcutr.then(|| Dcutr::new(peer_id)).into();
         let relay_config = options.relay_server_config.clone().into();
 
-        let relay = Toggle::from(
-            protocols
-                .relay_server
-                .then(|| Relay::new(peer_id, relay_config)),
-        );
+        let relay = protocols
+            .relay_server
+            .then(|| Relay::new(peer_id, relay_config))
+            .into();
 
-        let upnp = Toggle::from(protocols.upnp.then(libp2p::upnp::tokio::Behaviour::default));
+        #[cfg(not(target_arch = "wasm32"))]
+        let upnp = protocols
+            .upnp
+            .then(libp2p::upnp::tokio::Behaviour::default)
+            .into();
 
         let (transport, relay_client, relay_manager) = match protocols.relay_client {
             true => {
@@ -554,53 +509,202 @@ where
         #[cfg(feature = "experimental_stream")]
         let stream = protocols.streams.then(libp2p_stream::Behaviour::new).into();
 
-        Ok((
-            Behaviour {
-                mdns,
-                kademlia,
-                bitswap,
-                ping,
-                identify,
-                autonat,
-                pubsub,
-                dcutr,
-                relay,
-                relay_client,
-                relay_manager,
-                block_list,
-                #[cfg(feature = "experimental_stream")]
-                stream,
-                upnp,
-                peerbook,
-                addressbook,
-                protocol,
-                custom,
-                rendezvous_client,
-                rendezvous_server,
-            },
-            transport,
-        ))
-    }
+        let connection_limits = options
+            .connection_limits
+            .clone()
+            .map(libp2p_connection_limits::Behaviour::new)
+            .into();
 
-    pub fn add_peer(&mut self, peer: PeerId, addr: Multiaddr) -> bool {
-        if self.addressbook.contains(&peer, &addr) {
-            return false;
-        }
+        let mut behaviour = Behaviour {
+            connection_limits,
+            #[cfg(not(target_arch = "wasm32"))]
+            mdns,
+            kademlia,
+            bitswap,
+            ping,
+            identify,
+            autonat,
+            pubsub,
+            dcutr,
+            relay,
+            relay_client,
+            relay_manager,
+            block_list,
+            #[cfg(feature = "experimental_stream")]
+            stream,
+            #[cfg(not(target_arch = "wasm32"))]
+            upnp,
+            peerbook,
+            addressbook,
+            protocol,
+            custom,
+            rendezvous_client,
+            rendezvous_server,
+            rr_man: Toggle::from(None),
+            rr_0: Toggle::from(None),
+            rr_1: Toggle::from(None),
+            rr_2: Toggle::from(None),
+            rr_3: Toggle::from(None),
+            rr_4: Toggle::from(None),
+            rr_5: Toggle::from(None),
+            rr_6: Toggle::from(None),
+            rr_7: Toggle::from(None),
+            rr_8: Toggle::from(None),
+            rr_9: Toggle::from(None),
+        };
 
-        if !self.addressbook.contains(&peer, &addr) {
-            self.addressbook.add_address(peer, addr.clone());
-        }
+        let mut existing_protocol: IndexMap<StreamProtocol, _> = IndexMap::new();
 
-        if let Some(kad) = self.kademlia.as_mut() {
-            kad.add_address(&peer, addr.clone());
-        }
+        match options.request_response_config {
+            Either::Left(ref config) => {
+                let protocol = StreamProtocol::try_from_owned(config.protocol.clone())
+                    .expect("valid protocol");
+                existing_protocol.insert(protocol, 0);
+                behaviour.rr_0 = protocols
+                    .request_response
+                    .then(|| request_response::Behaviour::new(config.clone()))
+                    .into();
+            }
+            Either::Right(ref configs) => {
+                for (index, config) in configs.iter().enumerate() {
+                    let protocol = StreamProtocol::try_from_owned(config.protocol.clone())
+                        .expect("valid protocol");
+                    if existing_protocol.contains_key(&protocol) {
+                        tracing::warn!(%protocol, "request-response protocol is already registered");
+                        continue;
+                    };
 
-        #[cfg(feature = "libp2p_bitswap")]
-        {
-            if let Some(bs) = self.bitswap.as_mut() {
-                bs.add_address(&peer, addr);
+                    match index {
+                        0 => {
+                            if behaviour.rr_0.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_0 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        1 => {
+                            if behaviour.rr_1.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_1 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        2 => {
+                            if behaviour.rr_2.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_2 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        3 => {
+                            if behaviour.rr_3.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_3 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        4 => {
+                            if behaviour.rr_4.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_4 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        5 => {
+                            if behaviour.rr_5.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_5 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        6 => {
+                            if behaviour.rr_6.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_6 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        7 => {
+                            if behaviour.rr_7.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_7 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        8 => {
+                            if behaviour.rr_8.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_8 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        9 => {
+                            if behaviour.rr_9.is_enabled() {
+                                continue;
+                            }
+                            behaviour.rr_9 = protocols
+                                .request_response
+                                .then(|| request_response::Behaviour::new(config.clone()))
+                                .into();
+                        }
+                        _ => {
+                            tracing::warn!("local node can only support up to 10 request-response protocols at this time.");
+                            break;
+                        }
+                    }
+
+                    existing_protocol.insert(protocol, index);
+                }
             }
         }
+
+        if !existing_protocol.is_empty() {
+            behaviour.rr_man = Toggle::from(Some(rr_man::Behaviour::new(existing_protocol)))
+        }
+
+        for addr in bootstrap {
+            let Ok(mut opt) = IntoAddPeerOpt::into_opt(addr) else {
+                continue;
+            };
+
+            // explicitly dial the bootstrap peer. If the peer will be bootstrapped via kad, the additional dial will be cancelled
+            opt = opt.set_dial(true);
+
+            _ = behaviour.add_peer(opt);
+        }
+
+        Ok((behaviour, transport))
+    }
+
+    pub fn add_peer<I: IntoAddPeerOpt>(&mut self, opt: I) -> bool {
+        let opt = opt.into_opt().expect("valid entries");
+        if let Some(kad) = self.kademlia.as_mut() {
+            let peer_id = opt.peer_id();
+            let addrs = opt.addresses().to_vec();
+            for addr in addrs {
+                kad.add_address(peer_id, addr);
+            }
+        }
+
+        self.addressbook.add_address(opt);
 
         true
     }
@@ -625,31 +729,49 @@ where
         self.protocol.iter().collect::<Vec<_>>()
     }
 
-    #[cfg(feature = "beetle_bitswap")]
-    pub fn notify_new_blocks(&self, blocks: Vec<crate::Block>) {
-        if let Some(bitswap) = self.bitswap.as_ref() {
-            let client = bitswap.client().clone();
-            tokio::task::spawn(async move {
-                let blocks = blocks
-                    .iter()
-                    .map(|block| beetle_bitswap_next::Block {
-                        cid: *block.cid(),
-                        data: Bytes::copy_from_slice(block.data()),
-                    })
-                    .collect::<Vec<_>>();
-                if let Err(err) = client.notify_new_blocks(&blocks).await {
-                    warn!("failed to notify bitswap about blocks: {:?}", err);
-                }
-            });
-        }
-    }
-
     pub fn pubsub(&mut self) -> Option<&mut GossipsubStream> {
         self.pubsub.as_mut()
     }
 
-    #[cfg(feature = "beetle_bitswap")]
-    pub fn bitswap(&mut self) -> Option<&mut Bitswap<Repo>> {
-        self.bitswap.as_mut()
+    pub fn request_response(
+        &mut self,
+        protocol: Option<StreamProtocol>,
+    ) -> Option<&mut request_response::Behaviour> {
+        let Some(protocol) = protocol else {
+            return self.rr_0.as_mut();
+        };
+
+        let manager = self.rr_man.as_ref()?;
+        let index = manager.get_protocol(protocol)?;
+        match index {
+            0 => self.rr_0.as_mut(),
+            1 => self.rr_1.as_mut(),
+            2 => self.rr_2.as_mut(),
+            3 => self.rr_3.as_mut(),
+            4 => self.rr_4.as_mut(),
+            5 => self.rr_5.as_mut(),
+            6 => self.rr_6.as_mut(),
+            7 => self.rr_7.as_mut(),
+            8 => self.rr_8.as_mut(),
+            9 => self.rr_9.as_mut(),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_duration_test() {
+        let base = Duration::from_secs(1);
+        let dur = max_duration(base);
+        assert_eq!(dur, base);
+
+        let base = Duration::MAX;
+        let dur = max_duration(base);
+        assert_ne!(dur, base);
+        assert_eq!(dur, Duration::from_secs(u32::MAX as _))
     }
 }

@@ -5,9 +5,10 @@ use crate::Block;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use libipld::Cid;
+use ipld_core::cid::Cid;
 use tokio::sync::RwLock;
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ impl std::fmt::Debug for MemBlockStore {
 }
 
 struct MemBlockInner {
-    blocks: HashMap<Cid, Block>,
+    blocks: HashMap<Cid, Bytes>,
 }
 
 impl MemBlockStore {
@@ -47,10 +48,6 @@ impl BlockStore for MemBlockStore {
         Ok(())
     }
 
-    async fn open(&self) -> Result<(), Error> {
-        Ok(())
-    }
-
     async fn contains(&self, cid: &Cid) -> Result<bool, Error> {
         let inner = &*self.inner.read().await;
         Ok(inner.blocks.contains_key(cid))
@@ -58,8 +55,12 @@ impl BlockStore for MemBlockStore {
 
     async fn get(&self, cid: &Cid) -> Result<Option<Block>, Error> {
         let inner = &*self.inner.read().await;
-        let block = inner.blocks.get(cid).cloned();
-        Ok(block)
+        let block = match inner.blocks.get(cid) {
+            Some(bytes) => Block::new(*cid, bytes.clone())?,
+            None => return Ok(None),
+        };
+
+        Ok(Some(block))
     }
 
     async fn size(&self, cid: &[Cid]) -> Result<Option<usize>, Error> {
@@ -69,17 +70,17 @@ impl BlockStore for MemBlockStore {
                 .blocks
                 .iter()
                 .filter(|(id, _)| cid.contains(id))
-                .map(|(_, b)| b.data().len())
+                .map(|(_, b)| b.len())
                 .sum(),
         ))
     }
 
     async fn total_size(&self) -> Result<usize, Error> {
         let inner = &*self.inner.read().await;
-        Ok(inner.blocks.values().map(|b| b.data().len()).sum())
+        Ok(inner.blocks.values().map(|b| b.len()).sum())
     }
 
-    async fn put(&self, block: Block) -> Result<(Cid, BlockPut), Error> {
+    async fn put(&self, block: &Block) -> Result<(Cid, BlockPut), Error> {
         use std::collections::hash_map::Entry;
 
         let inner = &mut *self.inner.write().await;
@@ -92,7 +93,7 @@ impl BlockStore for MemBlockStore {
             Entry::Vacant(ve) => {
                 trace!("new block");
                 let cid = *ve.key();
-                ve.insert(block);
+                ve.insert(block.inner_data().clone());
                 Ok((cid, BlockPut::NewBlock))
             }
         }
@@ -131,22 +132,19 @@ impl BlockStore for MemBlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockCodec;
     use crate::Block;
-    use libipld::{
-        multihash::{Code, MultihashDigest},
-        IpldCodec,
-    };
+    use multihash_codetable::{Code, MultihashDigest};
 
     #[tokio::test]
     async fn test_mem_blockstore() {
         let tmp = std::env::temp_dir();
         let store = MemBlockStore::new(tmp);
         let data = b"1".to_vec();
-        let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data));
+        let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data));
         let block = Block::new(cid, data).unwrap();
 
         store.init().await.unwrap();
-        store.open().await.unwrap();
 
         let contains = store.contains(&cid);
         assert!(!contains.await.unwrap());
@@ -156,7 +154,7 @@ mod tests {
             panic!("block should not be found")
         }
 
-        let put = store.put(block.clone());
+        let put = store.put(&block);
         assert_eq!(put.await.unwrap().0, cid.to_owned());
         let contains = store.contains(&cid);
         assert!(contains.await.unwrap());
@@ -176,13 +174,12 @@ mod tests {
         let mem_store = MemBlockStore::new(tmp);
 
         mem_store.init().await.unwrap();
-        mem_store.open().await.unwrap();
 
         for data in &[b"1", b"2", b"3"] {
             let data_slice = data.to_vec();
-            let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data_slice));
+            let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data_slice));
             let block = Block::new(cid, data_slice).unwrap();
-            mem_store.put(block.clone()).await.unwrap();
+            mem_store.put(&block).await.unwrap();
             assert!(mem_store.contains(block.cid()).await.unwrap());
         }
 

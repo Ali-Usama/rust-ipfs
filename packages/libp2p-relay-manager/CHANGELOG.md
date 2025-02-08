@@ -1,3 +1,22 @@
+# 0.4.0
+- chore: update libp2p to 0.55.0. [PR 375](https://github.com/dariusc93/rust-ipfs/pull/375)
+
+# 0.3.1
+
+# 0.3.0
+- chore: Update libp2p to 0.54. [PR 289](https://github.com/dariusc93/rust-ipfs/pull/289)
+
+# 0.2.5
+
+# 0.2.4
+- fix: Emit event to swarm after exhausting possible relays.
+
+# 0.2.3
+- fix: Enable wasm-bindgen feature when targetting wasm target
+
+# 0.2.2
+- chore: Add wasm support
+
 # 0.2.1
 - chore: Update libp2p to 0.53 [PR 116]
 - chore: Ignore deprecation warnings [PR 112]

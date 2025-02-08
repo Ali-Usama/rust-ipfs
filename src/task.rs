@@ -9,49 +9,36 @@ use futures::{
     FutureExt, StreamExt,
 };
 
-#[cfg(feature = "beetle_bitswap")]
-use futures::SinkExt;
-
-use crate::TSwarmEvent;
 use crate::{p2p::MultiaddrExt, Channel, InnerPubsubEvent};
+use crate::{ConnectionEvents, PeerConnectionEvents, TSwarmEvent};
 
-#[cfg(feature = "beetle_bitswap")]
-use beetle_bitswap_next::BitswapEvent;
-
-#[cfg(feature = "libp2p_bitswap")]
-use libp2p_bitswap_next::BitswapEvent;
-
-#[cfg(feature = "libp2p_bitswap")]
-use libipld::Cid;
-
-#[cfg(feature = "beetle_bitswap")]
-use tokio::task::JoinHandle;
-
-use wasm_timer::Interval;
-
+use crate::{config::BOOTSTRAP_NODES, IpfsEvent, TSwarmEventFn};
+use futures_timer::Delay;
+use ipld_core::cid::Cid;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     time::Duration,
 };
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use crate::{config::BOOTSTRAP_NODES, IpfsEvent, TSwarmEventFn};
-
 use crate::{
     p2p::TSwarm,
     repo::{Repo, RepoEvent},
+    AddPeerOpt,
 };
 
 pub use crate::{p2p::BehaviourEvent, p2p::KadResult};
 
-use libipld::multibase::{self, Base};
-pub use libp2p::{
-    self, core::transport::ListenerId, kad::RecordKey as Key, swarm::NetworkBehaviour, Multiaddr,
-    PeerId,
-};
+pub use libp2p::{self, core::transport::ListenerId, swarm::NetworkBehaviour, Multiaddr, PeerId};
+use multibase::Base;
 
+use libp2p::core::{ConnectedPoint, Endpoint};
+#[cfg(not(target_arch = "wasm32"))]
+use libp2p::mdns::Event as MdnsEvent;
+use libp2p::multiaddr::Protocol;
 use libp2p::{
     autonat,
     identify::{Event as IdentifyEvent, Info as IdentifyInfo},
@@ -60,68 +47,68 @@ use libp2p::{
         GetClosestPeersError, GetClosestPeersOk, GetProvidersError, GetProvidersOk, GetRecordError,
         GetRecordOk, PutRecordError, PutRecordOk, QueryId, QueryResult::*, Record,
     },
-    mdns::Event as MdnsEvent,
     rendezvous::{Cookie, Namespace},
     swarm::{ConnectionId, SwarmEvent},
 };
+use tokio::sync::Notify;
 
 /// Background task of `Ipfs` created when calling `UninitializedIpfs::start`.
 // The receivers are Fuse'd so that we don't have to manage state on them being exhausted.
 #[allow(clippy::type_complexity)]
 #[allow(dead_code)]
-pub(crate) struct IpfsTask<C: NetworkBehaviour<ToSwarm = void::Void>> {
-    pub(crate) swarm: TSwarm<C>,
-    pub(crate) repo_events: Fuse<Receiver<RepoEvent>>,
-    pub(crate) from_facade: Fuse<Receiver<IpfsEvent>>,
-    pub(crate) listening_addresses: HashMap<ListenerId, Vec<Multiaddr>>,
-    pub(crate) provider_stream: HashMap<QueryId, UnboundedSender<PeerId>>,
-    pub(crate) bitswap_provider_stream:
-        HashMap<QueryId, futures::channel::mpsc::Sender<Result<HashSet<PeerId>, String>>>,
-    pub(crate) record_stream: HashMap<QueryId, UnboundedSender<Record>>,
-    pub(crate) repo: Repo,
-    pub(crate) kad_subscriptions: HashMap<QueryId, Channel<KadResult>>,
-    pub(crate) dht_peer_lookup: HashMap<PeerId, Vec<Channel<libp2p::identify::Info>>>,
-    pub(crate) bootstraps: HashSet<Multiaddr>,
-    pub(crate) swarm_event: Option<TSwarmEventFn<C>>,
-    #[cfg(feature = "beetle_bitswap")]
-    pub(crate) bitswap_sessions: HashMap<u64, Vec<(oneshot::Sender<()>, JoinHandle<()>)>>,
-    #[cfg(feature = "libp2p_bitswap")]
-    pub(crate) bitswap_sessions: HashMap<libp2p_bitswap_next::QueryId, Cid>,
-    #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
-    pub(crate) bitswap_sessions: HashMap<i64, libipld::Cid>,
-    pub(crate) pubsub_event_stream: Vec<UnboundedSender<InnerPubsubEvent>>,
-    pub(crate) timer: TaskTimer,
-    pub(crate) local_external_addr: bool,
-    pub(crate) relay_listener: HashMap<PeerId, Vec<Channel<()>>>,
-    pub(crate) rzv_register_pending: HashMap<(PeerId, Namespace), Vec<Channel<()>>>,
-    pub(crate) rzv_discover_pending:
+pub struct IpfsTask<C: NetworkBehaviour<ToSwarm = Infallible>> {
+    pub swarm: TSwarm<C>,
+    pub repo_events: Fuse<Receiver<RepoEvent>>,
+    pub from_facade: Fuse<Receiver<IpfsEvent>>,
+    pub bitswap_cancellable: HashMap<Cid, Vec<Arc<Notify>>>,
+    pub listening_addresses: HashMap<ListenerId, Vec<Multiaddr>>,
+    pub provider_stream: HashMap<QueryId, UnboundedSender<PeerId>>,
+    pub record_stream: HashMap<QueryId, UnboundedSender<Record>>,
+    pub repo: Repo,
+    pub kad_subscriptions: HashMap<QueryId, Channel<KadResult>>,
+    pub dht_peer_lookup: HashMap<PeerId, Vec<Channel<libp2p::identify::Info>>>,
+    pub bootstraps: HashSet<Multiaddr>,
+    pub swarm_event: Option<TSwarmEventFn<C>>,
+    pub pubsub_event_stream: Vec<UnboundedSender<InnerPubsubEvent>>,
+    pub timer: TaskTimer,
+    pub local_external_addr: bool,
+    pub relay_listener: HashMap<PeerId, Vec<Channel<()>>>,
+    pub rzv_register_pending: HashMap<(PeerId, Namespace), Vec<Channel<()>>>,
+    pub rzv_discover_pending:
         HashMap<(PeerId, Namespace), Vec<Channel<HashMap<PeerId, Vec<Multiaddr>>>>>,
-    pub(crate) rzv_cookie: HashMap<PeerId, Option<Cookie>>,
+    pub rzv_cookie: HashMap<PeerId, Option<Cookie>>,
 
-    pub(crate) pending_connection: HashMap<ConnectionId, Channel<()>>,
-    pub(crate) pending_disconnection: HashMap<PeerId, Vec<Channel<()>>>,
-    pub(crate) pending_add_listener: HashMap<ListenerId, Channel<Multiaddr>>,
-    pub(crate) pending_remove_listener: HashMap<ListenerId, Channel<()>>,
+    pub peer_connection_events:
+        HashMap<PeerId, Vec<futures::channel::mpsc::Sender<PeerConnectionEvents>>>,
+    pub connection_events: Vec<futures::channel::mpsc::Sender<ConnectionEvents>>,
+
+    pub pending_connection: HashMap<ConnectionId, Channel<ConnectionId>>,
+    pub pending_disconnection: HashMap<PeerId, Vec<Channel<()>>>,
+    pub pending_add_listener: HashMap<ListenerId, Channel<Multiaddr>>,
+    pub pending_remove_listener: HashMap<ListenerId, Channel<()>>,
+
+    pub event_capacity: usize,
 }
 
-impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
+impl<C: NetworkBehaviour<ToSwarm = Infallible>> IpfsTask<C> {
     pub fn new(
         swarm: TSwarm<C>,
         repo_events: Fuse<Receiver<RepoEvent>>,
         from_facade: Fuse<Receiver<IpfsEvent>>,
         repo: &Repo,
+        event_capacity: usize,
     ) -> Self {
         IpfsTask {
             repo_events,
             from_facade,
             swarm,
+            event_capacity,
             provider_stream: HashMap::new(),
-            bitswap_provider_stream: Default::default(),
             record_stream: HashMap::new(),
             dht_peer_lookup: Default::default(),
-            bitswap_sessions: Default::default(),
             pubsub_event_stream: Default::default(),
             kad_subscriptions: Default::default(),
+            bitswap_cancellable: Default::default(),
             repo: repo.clone(),
             bootstraps: Default::default(),
             swarm_event: Default::default(),
@@ -132,6 +119,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
             rzv_discover_pending: Default::default(),
             rzv_cookie: Default::default(),
             listening_addresses: HashMap::new(),
+            peer_connection_events: HashMap::new(),
+            connection_events: Vec::new(),
             pending_disconnection: Default::default(),
             pending_connection: Default::default(),
             pending_add_listener: Default::default(),
@@ -140,27 +129,19 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
     }
 }
 
-pub(crate) struct TaskTimer {
-    #[cfg(feature = "beetle_bitswap")]
-    pub(crate) session_cleanup: Interval,
-    pub(crate) event_cleanup: Interval,
+pub struct TaskTimer {
+    pub event_cleanup: Delay,
 }
 
 impl Default for TaskTimer {
     fn default() -> Self {
-        #[cfg(feature = "beetle_bitswap")]
-        let session_cleanup = Interval::new(Duration::from_secs(5));
-        let event_cleanup = Interval::new(Duration::from_secs(60));
+        let event_cleanup = Delay::new(Duration::from_secs(60));
 
-        Self {
-            #[cfg(feature = "beetle_bitswap")]
-            session_cleanup,
-            event_cleanup,
-        }
+        Self { event_cleanup }
     }
 }
 
-impl<C: NetworkBehaviour<ToSwarm = void::Void>> futures::Future for IpfsTask<C> {
+impl<C: NetworkBehaviour<ToSwarm = Infallible>> futures::Future for IpfsTask<C> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -186,43 +167,23 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> futures::Future for IpfsTask<C> 
             }
         }
 
-        if self.timer.event_cleanup.poll_next_unpin(cx).is_ready() {
+        if self.timer.event_cleanup.poll_unpin(cx).is_ready() {
             self.pubsub_event_stream.retain(|ch| !ch.is_closed());
-        }
-
-        #[cfg(feature = "beetle_bitswap")]
-        {
-            if self.timer.session_cleanup.poll_next_unpin(cx).is_ready() {
-                let mut to_remove = Vec::new();
-                for (id, tasks) in &mut self.bitswap_sessions {
-                    tasks.retain(|(_, task)| !task.is_finished());
-
-                    if tasks.is_empty() {
-                        to_remove.push(*id);
-                    }
-
-                    // Only do a small chunk of cleanup on each iteration
-                    // TODO(arqu): magic number
-                    if to_remove.len() >= 10 {
-                        break;
-                    }
-                }
-
-                for id in to_remove {
-                    let (tx, _rx) = oneshot::channel();
-                    self.destroy_bs_session(id, tx);
-                }
-            }
+            self.connection_events.retain(|ch| !ch.is_closed());
+            self.peer_connection_events.retain(|_, ch_list| {
+                ch_list.retain(|ch| !ch.is_closed());
+                !ch_list.is_empty()
+            });
+            self.timer.event_cleanup.reset(Duration::from_secs(60));
         }
 
         Poll::Pending
     }
 }
 
-impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
-    pub(crate) async fn run(&mut self) {
-        let mut session_cleanup = tokio::time::interval(Duration::from_secs(5 * 60));
-        let mut event_cleanup = tokio::time::interval(Duration::from_secs(60));
+impl<C: NetworkBehaviour<ToSwarm = Infallible>> IpfsTask<C> {
+    pub async fn run(&mut self) {
+        let mut event_cleanup = futures_timer::Delay::new(Duration::from_secs(60));
 
         loop {
             tokio::select! {
@@ -239,63 +200,16 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     }
                     self.handle_event(event);
                 },
-                _ = event_cleanup.tick() => {
+                _ = &mut event_cleanup => {
                     self.pubsub_event_stream.retain(|ch| !ch.is_closed());
-                }
-                _ = session_cleanup.tick() => {
-                    #[cfg(feature = "beetle_bitswap")]
-                    {
-                        let mut to_remove = Vec::new();
-                        for (id, tasks) in &mut self.bitswap_sessions {
-                            tasks.retain(|(_, task)| !task.is_finished());
-
-                            if tasks.is_empty() {
-                                to_remove.push(*id);
-                            }
-
-                            // Only do a small chunk of cleanup on each iteration
-                            // TODO(arqu): magic number
-                            if to_remove.len() >= 10 {
-                                break;
-                            }
-                        }
-
-                        for id in to_remove {
-                            let (tx, _rx) = oneshot::channel();
-                            self.destroy_bs_session(id, tx);
-                        }
-                    }
+                    self.connection_events.retain(|ch| !ch.is_closed());
+                    self.peer_connection_events.retain(|_, ch_list| {
+                        ch_list.retain(|ch| !ch.is_closed());
+                        !ch_list.is_empty()
+                    });
+                    event_cleanup.reset(Duration::from_secs(60));
                 }
             }
-        }
-    }
-
-    #[cfg(feature = "beetle_bitswap")]
-    fn destroy_bs_session(&mut self, ctx: u64, ret: oneshot::Sender<anyhow::Result<()>>) {
-        if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
-            let client = bitswap.client().clone();
-            let workers: Option<Vec<(oneshot::Sender<()>, JoinHandle<()>)>> =
-                self.bitswap_sessions.remove(&ctx);
-            tokio::task::spawn(async move {
-                debug!("stopping session {}", ctx);
-                if let Some(workers) = workers {
-                    debug!("stopping workers {} for session {}", workers.len(), ctx);
-                    // first shutdown workers
-                    for (closer, worker) in workers {
-                        if closer.send(()).is_ok() {
-                            worker.await.ok();
-                        }
-                    }
-                    debug!("all workers stopped for session {}", ctx);
-                }
-                if let Err(err) = client.stop_session(ctx).await {
-                    warn!("failed to stop session {}: {:?}", ctx, err);
-                }
-                if let Err(err) = ret.send(Ok(())) {
-                    warn!("session {} failed to send stop response: {:?}", ctx, err);
-                }
-                debug!("session {} stopped", ctx);
-            });
         }
     }
 
@@ -336,9 +250,62 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let _ = ret.send(Ok(address));
                 }
             }
-            SwarmEvent::ConnectionEstablished { connection_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
+            } => {
                 if let Some(ch) = self.pending_connection.remove(&connection_id) {
-                    _ = ch.send(Ok(()));
+                    let _ = ch.send(Ok(connection_id));
+                }
+
+                let (ep, mut addr) = match &endpoint {
+                    ConnectedPoint::Dialer { address, .. } => (Endpoint::Dialer, address.clone()),
+                    ConnectedPoint::Listener { local_addr, .. } if endpoint.is_relayed() => {
+                        (Endpoint::Listener, local_addr.clone())
+                    }
+                    ConnectedPoint::Listener { send_back_addr, .. } => {
+                        (Endpoint::Listener, send_back_addr.clone())
+                    }
+                };
+
+                if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+                    addr.pop();
+                }
+
+                if let Some(ch_list) = self.peer_connection_events.get_mut(&peer_id) {
+                    let ev = match ep {
+                        Endpoint::Dialer => PeerConnectionEvents::OutgoingConnection {
+                            connection_id,
+                            addr: addr.clone(),
+                        },
+                        Endpoint::Listener => PeerConnectionEvents::IncomingConnection {
+                            connection_id,
+                            addr: addr.clone(),
+                        },
+                    };
+
+                    for ch in ch_list {
+                        let _ = ch.try_send(ev.clone());
+                    }
+                }
+
+                for ch in &mut self.connection_events {
+                    let ev = match ep {
+                        Endpoint::Dialer => ConnectionEvents::OutgoingConnection {
+                            peer_id,
+                            connection_id,
+                            addr: addr.clone(),
+                        },
+                        Endpoint::Listener => ConnectionEvents::IncomingConnection {
+                            peer_id,
+                            connection_id,
+                            addr: addr.clone(),
+                        },
+                    };
+
+                    let _ = ch.try_send(ev);
                 }
             }
             SwarmEvent::OutgoingConnectionError {
@@ -347,14 +314,32 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 ..
             } => {
                 if let Some(ch) = self.pending_connection.remove(&connection_id) {
-                    _ = ch.send(Err(anyhow::Error::from(error)));
+                    let _ = ch.send(Err(anyhow::Error::from(error)));
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                ..
+            } => {
                 if let Some(ch) = self.pending_disconnection.remove(&peer_id) {
                     for ch in ch {
                         let _ = ch.send(Ok(()));
                     }
+                }
+
+                if let Some(ch_list) = self.peer_connection_events.get_mut(&peer_id) {
+                    for ch in ch_list {
+                        let _ =
+                            ch.try_send(PeerConnectionEvents::ClosedConnection { connection_id });
+                    }
+                }
+
+                for ch in &mut self.connection_events {
+                    let _ = ch.try_send(ConnectionEvents::ClosedConnection {
+                        peer_id,
+                        connection_id,
+                    });
                 }
             }
             SwarmEvent::ExpiredListenAddr {
@@ -386,10 +371,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let _ = ret.send(Err(error.into()));
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(event)) => match event {
                 MdnsEvent::Discovered(list) => {
                     for (peer, addr) in list {
-                        self.swarm.behaviour_mut().add_peer(peer, addr);
+                        self.swarm.behaviour_mut().add_peer((peer, addr));
                     }
                 }
                 MdnsEvent::Expired(list) => {
@@ -447,41 +433,25 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                             Bootstrap(Err(BootstrapError::Timeout { .. })) => {
                                 warn!("kad: timed out while trying to bootstrap");
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!(
-                                            "kad: timed out while trying to bootstrap"
-                                        )));
-                                    }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "kad: timed out while trying to bootstrap"
+                                    )));
                                 }
                             }
                             GetClosestPeers(Ok(GetClosestPeersOk { key, peers })) => {
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Ok(KadResult::Peers(peers.clone())));
-                                    }
-                                    if let Ok(peer_id) = PeerId::from_bytes(&key) {
-                                        if let Some(rets) = self.dht_peer_lookup.remove(&peer_id) {
-                                            if !peers.contains(&peer_id) {
-                                                for ret in rets {
-                                                    let _ = ret.send(Err(anyhow::anyhow!(
-                                                        "Could not locate peer"
-                                                    )));
-                                                }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Ok(KadResult::Peers(
+                                        peers.iter().map(|info| info.peer_id).collect(),
+                                    )));
+                                }
+                                if let Ok(peer_id) = PeerId::from_bytes(&key) {
+                                    if let Some(rets) = self.dht_peer_lookup.remove(&peer_id) {
+                                        if !peers.iter().any(|info| info.peer_id == peer_id) {
+                                            for ret in rets {
+                                                let _ = ret.send(Err(anyhow::anyhow!(
+                                                    "Could not locate peer"
+                                                )));
                                             }
                                         }
                                     }
@@ -494,26 +464,17 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 // don't mention the key here, as this is just the id of our node
                                 warn!("kad: timed out while trying to find all closest peers");
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!(
-                                            "timed out while trying to find all closest peers"
-                                        )));
-                                    }
-                                    if let Ok(peer_id) = PeerId::from_bytes(&key) {
-                                        if let Some(rets) = self.dht_peer_lookup.remove(&peer_id) {
-                                            for ret in rets {
-                                                let _ = ret.send(Err(anyhow::anyhow!(
-                                                    "timed out while trying to find all closest peers"
-                                                )));
-                                            }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "timed out while trying to find all closest peers"
+                                    )));
+                                }
+                                if let Ok(peer_id) = PeerId::from_bytes(&key) {
+                                    if let Some(rets) = self.dht_peer_lookup.remove(&peer_id) {
+                                        for ret in rets {
+                                            let _ = ret.send(Err(anyhow::anyhow!(
+                                                "timed out while trying to find all closest peers"
+                                            )));
                                         }
                                     }
                                 }
@@ -522,25 +483,10 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 key: _,
                                 providers,
                             })) => {
-                                if !providers.is_empty() {
-                                    #[cfg(feature = "beetle_bitswap")]
-                                    {
-                                        if let Entry::Occupied(entry) =
-                                            self.bitswap_provider_stream.entry(id)
-                                        {
-                                            let providers = providers.clone();
-                                            let mut tx = entry.get().clone();
-                                            tokio::spawn(async move {
-                                                let _ = tx.send(Ok(providers)).await;
-                                            });
-                                        }
-                                    }
-                                }
                                 if let Entry::Occupied(entry) = self.provider_stream.entry(id) {
-                                    if !providers.is_empty() {
-                                        for provider in providers {
-                                            let _ = entry.get().unbounded_send(provider);
-                                        }
+                                    let tx = entry.get();
+                                    for provider in providers {
+                                        let _ = tx.unbounded_send(provider);
                                     }
                                 }
                             }
@@ -551,26 +497,16 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                     if let Some(tx) = self.provider_stream.remove(&id) {
                                         tx.close_channel();
                                     }
-                                    if let Some(tx) = self.bitswap_provider_stream.remove(&id) {
-                                        drop(tx);
-                                    }
                                 }
                             }
                             GetProviders(Err(GetProvidersError::Timeout { key, .. })) => {
                                 let key = multibase::encode(Base::Base32Lower, key);
                                 warn!("kad: timed out while trying to get providers for {}", key);
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!("timed out while trying to get providers for the given key")));
-                                    }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "timed out while trying to get providers for the given key"
+                                    )));
                                 }
                             }
                             StartProviding(Ok(AddProviderOk { key })) => {
@@ -581,19 +517,10 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 let key = multibase::encode(Base::Base32Lower, key);
                                 warn!("kad: timed out while trying to provide {}", key);
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!(
-                                            "kad: timed out while trying to provide the record"
-                                        )));
-                                    }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "kad: timed out while trying to provide the record"
+                                    )));
                                 }
                             }
                             RepublishProvider(Ok(AddProviderOk { key })) => {
@@ -625,17 +552,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 let key = multibase::encode(Base::Base32Lower, key);
                                 warn!("kad: couldn't find record {}", key);
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(tx) = self.record_stream.remove(&id) {
-                                        tx.close_channel();
-                                    }
+                                if let Some(tx) = self.record_stream.remove(&id) {
+                                    tx.close_channel();
                                 }
                             }
                             GetRecord(Err(GetRecordError::QuorumFailed {
@@ -649,34 +567,16 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                     quorum, key
                                 );
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(tx) = self.record_stream.remove(&id) {
-                                        tx.close_channel();
-                                    }
+                                if let Some(tx) = self.record_stream.remove(&id) {
+                                    tx.close_channel();
                                 }
                             }
                             GetRecord(Err(GetRecordError::Timeout { key })) => {
                                 let key = multibase::encode(Base::Base32Lower, key);
                                 warn!("kad: timed out while trying to get key {}", key);
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(tx) = self.record_stream.remove(&id) {
-                                        tx.close_channel();
-                                    }
+                                if let Some(tx) = self.record_stream.remove(&id) {
+                                    tx.close_channel();
                                 }
                             }
                             PutRecord(Ok(PutRecordOk { key }))
@@ -700,19 +600,10 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                     quorum, key
                                 );
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!(
-                                            "kad: quorum failed when trying to put the record"
-                                        )));
-                                    }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "kad: quorum failed when trying to put the record"
+                                    )));
                                 }
                             }
                             PutRecord(Err(PutRecordError::Timeout {
@@ -723,20 +614,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                                 let key = multibase::encode(Base::Base32Lower, key);
                                 warn!("kad: timed out while trying to put record {}", key);
 
-                                if self
-                                    .swarm
-                                    .behaviour()
-                                    .kademlia
-                                    .as_ref()
-                                    .and_then(|kad| kad.query(&id))
-                                    .is_none()
-                                {
-                                    if let Some(ret) = self.kad_subscriptions.remove(&id) {
-                                        let _ = ret.send(Err(anyhow::anyhow!(
-                                            "kad: timed out while trying to put record {}",
-                                            key
-                                        )));
-                                    }
+                                if let Some(ret) = self.kad_subscriptions.remove(&id) {
+                                    let _ = ret.send(Err(anyhow::anyhow!(
+                                        "kad: timed out while trying to put record {}",
+                                        key
+                                    )));
                                 }
                             }
                             RepublishRecord(Err(PutRecordError::Timeout {
@@ -768,42 +650,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                         trace!("kad: pending routable peer {} ({})", peer, address);
                     }
                     KademliaEvent::ModeChanged { new_mode } => {
-                        _ = new_mode;
+                        let _ = new_mode;
+                        trace!("kad: mode changed to {:?}", new_mode);
                     }
                 }
             }
-            #[cfg(feature = "beetle_bitswap")]
-            SwarmEvent::Behaviour(BehaviourEvent::Bitswap(event)) => match event {
-                BitswapEvent::Provide { key } => {
-                    if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
-                        let key = key.hash().to_bytes();
-                        let _id = kad.start_providing(key.into()).ok();
-                    }
-                }
-                BitswapEvent::FindProviders { key, response, .. } => {
-                    if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
-                        info!("Looking for providers for {key}");
-                        let key = key.hash().to_bytes();
-                        let id = kad.get_providers(key.into());
-                        self.bitswap_provider_stream.insert(id, response);
-                    }
-                }
-                BitswapEvent::Ping { peer, response } => {
-                    let duration = self.swarm.behaviour().peerbook.get_peer_latest_rtt(peer);
-                    let _ = response.send(duration).ok();
-                }
-            },
-            #[cfg(feature = "libp2p_bitswap")]
-            SwarmEvent::Behaviour(BehaviourEvent::Bitswap(event)) => match event {
-                BitswapEvent::Progress(id, remaining) => {
-                    tracing::trace!(id = %id, remaining_blocks = remaining);
-                }
-                BitswapEvent::Complete(id, result) => {
-                    let cid = self.bitswap_sessions.remove(&id);
-                    let cid = cid.expect("Valid session");
-                    tracing::debug!(id = %id, cid = %cid, result = ?result, "completed query");
-                }
-            },
             SwarmEvent::Behaviour(BehaviourEvent::Pubsub(
                 libp2p::gossipsub::Event::Subscribed { peer_id, topic },
             )) => self.emit_pubsub_event(InnerPubsubEvent::Subscribe {
@@ -886,7 +737,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
             }
 
             SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => match event {
-                IdentifyEvent::Received { peer_id, info } => {
+                IdentifyEvent::Received { peer_id, info, .. } => {
                     let IdentifyInfo {
                         listen_addrs,
                         protocols,
@@ -946,11 +797,13 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let namespace = registration.namespace.clone();
                     let peer_id = registration.record.peer_id();
                     let addrs = registration.record.addresses();
-                    for addr in addrs {
-                        if addrbook.add_address(peer_id, addr.clone()) {
-                            info!("Discovered {peer_id} with address {addr} in {namespace}");
-                        }
-                    }
+
+                    // info!("Discovered {peer_id} with address {addr} in {namespace}");
+
+                    let opts = AddPeerOpt::with_peer_id(peer_id).set_addresses(addrs.to_vec());
+
+                    addrbook.add_address(opts);
+
                     ns_book
                         .entry(namespace.clone())
                         .or_default()
@@ -1028,7 +881,6 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     }
                 }
             }
-            #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
             SwarmEvent::Behaviour(BehaviourEvent::Bitswap(event)) => match event {
                 crate::p2p::bitswap::Event::NeedBlock { cid } => {
                     if let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() {
@@ -1038,7 +890,12 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     }
                 }
                 crate::p2p::bitswap::Event::CancelBlock { cid } => {
-                    info!(%cid, "block request cancelled")
+                    info!(%cid, "block request cancelled");
+                    if let Some(list) = self.bitswap_cancellable.remove(&cid) {
+                        for signal in list {
+                            signal.notify_waiters();
+                        }
+                    }
                 }
                 crate::p2p::bitswap::Event::BlockRetrieved { cid } => {
                     info!(%cid, "block retrieved")
@@ -1054,7 +911,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let connection_id = target.connection_id();
 
                 if let Err(e) = self.swarm.dial(target) {
-                    _ = ret.send(Err(anyhow::Error::from(e)));
+                    let _ = ret.send(Err(anyhow::Error::from(e)));
                     return;
                 }
                 self.pending_connection.insert(connection_id, ret);
@@ -1070,7 +927,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     return;
                 };
 
-                _ = ret.send(Ok(stream.new_control()))
+                let _ = ret.send(Ok(stream.new_control()));
             }
             #[cfg(feature = "experimental_stream")]
             IpfsEvent::NewStream(protocol, ret) => {
@@ -1079,12 +936,12 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     return;
                 };
 
-                _ = ret.send(
+                let _ = ret.send(
                     stream
                         .new_control()
                         .accept(protocol)
                         .map_err(anyhow::Error::from),
-                )
+                );
             }
             IpfsEvent::Addresses(ret) => {
                 let addrs = self.swarm.behaviour_mut().addrs();
@@ -1113,7 +970,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
             }
             IpfsEvent::Disconnect(peer, ret) => {
                 if self.swarm.disconnect_peer_id(peer).is_err() {
-                    _ = ret.send(Err(anyhow::anyhow!("Peer is not connected")));
+                    let _ = ret.send(Err(anyhow::anyhow!("Peer is not connected")));
                     return;
                 }
 
@@ -1160,7 +1017,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     return;
                 };
 
-                let _ = ret.send(Ok(pubsub.subscribed_peers(&topic)));
+                let _ = ret.send(Ok(pubsub.subscribed_peers(topic)));
             }
             IpfsEvent::PubsubPeers(None, ret) => {
                 let Some(pubsub) = self.swarm.behaviour_mut().pubsub.as_mut() else {
@@ -1175,8 +1032,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     let _ = ret.send(Err(anyhow!("pubsub protocol is disabled")));
                     return;
                 };
-
-                let _ = ret.send(Ok(pubsub.subscribed_topics()));
+                let list = pubsub.topics().map(|t| t.to_string()).collect();
+                let _ = ret.send(Ok(list));
             }
             // IpfsEvent::WantList(peer, ret) => {
             //     let list = if let Some(peer) = peer {
@@ -1236,6 +1093,27 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     }
                 }
             }
+            IpfsEvent::AddExternalAddress(addr, ret) => {
+                self.swarm.add_external_address(addr);
+                let _ = ret.send(Ok(()));
+            }
+            IpfsEvent::RemoveExternalAddress(addr, ret) => {
+                self.swarm.remove_external_address(&addr);
+                let _ = ret.send(Ok(()));
+            }
+            IpfsEvent::ConnectionEvents(ret) => {
+                let (tx, rx) = futures::channel::mpsc::channel(self.event_capacity);
+                self.connection_events.push(tx);
+                let _ = ret.send(Ok(rx));
+            }
+            IpfsEvent::PeerConnectionEvents(peer_id, ret) => {
+                let (tx, rx) = futures::channel::mpsc::channel(self.event_capacity);
+                self.peer_connection_events
+                    .entry(peer_id)
+                    .or_default()
+                    .push(tx);
+                let _ = ret.send(Ok(rx));
+            }
             IpfsEvent::Bootstrap(ret) => {
                 let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
                     let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
@@ -1255,12 +1133,10 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 };
                 let _ = ret.send(future);
             }
-            IpfsEvent::AddPeer(peer_id, addr, ret) => {
-                let result = match self.swarm.behaviour_mut().add_peer(peer_id, addr.clone()) {
+            IpfsEvent::AddPeer(opt, ret) => {
+                let result = match self.swarm.behaviour_mut().add_peer(opt) {
                     true => Ok(()),
-                    false => Err(anyhow::anyhow!(
-                        "Unable to add {addr}. It either contains a `PeerId` or already exist."
-                    )),
+                    false => Err(anyhow::anyhow!("unable to add peer")),
                 };
 
                 let _ = ret.send(result);
@@ -1291,64 +1167,18 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 let _ = ret.send(Ok(rx));
             }
             IpfsEvent::WantList(peer, ret) => {
-                #[cfg(feature = "beetle_bitswap")]
-                {
-                    if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
-                        let client = bitswap.client().clone();
-                        let server = bitswap.server().cloned();
-
-                        let _ = ret.send(Ok(async move {
-                            if let Some(peer) = peer {
-                                if let Some(server) = server {
-                                    server.wantlist_for_peer(&peer).await
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                Vec::from_iter(client.get_wantlist().await)
-                            }
-                        }
-                        .boxed()));
-                    } else {
-                        let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                    }
-                }
-                #[cfg(feature = "libp2p_bitswap")]
-                {
-                    _ = peer;
+                let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() else {
                     let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                }
-                #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
-                {
-                    let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() else {
-                        let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                        return;
-                    };
-                    let list = match peer {
-                        Some(peer_id) => bitswap.peer_wantlist(peer_id),
-                        None => bitswap.local_wantlist(),
-                    };
-                    let _ = ret.send(Ok(futures::future::ready(list).boxed()));
-                }
+                    return;
+                };
+                let list = match peer {
+                    Some(peer_id) => bitswap.peer_wantlist(peer_id),
+                    None => bitswap.local_wantlist(),
+                };
+                let _ = ret.send(Ok(futures::future::ready(list).boxed()));
             }
             IpfsEvent::GetBitswapPeers(ret) => {
-                #[cfg(feature = "beetle_bitswap")]
-                {
-                    if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
-                        let client = bitswap.client().clone();
-                        let _ = ret.send(Ok(async move { client.get_peers().await }.boxed()));
-                    } else {
-                        let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                    }
-                }
-                #[cfg(feature = "libp2p_bitswap")]
-                {
-                    let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                }
-                #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
-                {
-                    let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
-                }
+                let _ = ret.send(Ok(futures::future::ready(vec![]).boxed()));
             }
             IpfsEvent::FindPeerIdentity(peer_id, ret) => {
                 let locally_known = self.swarm.behaviour().peerbook.get_peer_info(peer_id);
@@ -1394,7 +1224,6 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                         .behaviour()
                         .addressbook
                         .get_peer_addresses(&peer_id)
-                        .cloned()
                         .unwrap_or_default()
                 };
 
@@ -1417,13 +1246,12 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                 };
                 let _ = ret.send(Ok(addrs));
             }
-            IpfsEvent::GetProviders(cid, ret) => {
+            IpfsEvent::GetProviders(key, ret) => {
                 let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
                     let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
                     return;
                 };
 
-                let key = Key::from(cid.hash().to_bytes());
                 let id = kad.get_providers(key);
 
                 let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -1439,13 +1267,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
 
                 let _ = ret.send(Ok(Some(stream.boxed())));
             }
-            IpfsEvent::Provide(cid, ret) => {
+            IpfsEvent::Provide(key, ret) => {
                 let Some(kad) = self.swarm.behaviour_mut().kademlia.as_mut() else {
                     let _ = ret.send(Err(anyhow!("kad protocol is disabled")));
                     return;
                 };
-
-                let key = Key::from(cid.hash().to_bytes());
 
                 let future = match kad.start_providing(key) {
                     Ok(id) => {
@@ -1529,7 +1355,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
 
                 if self.bootstraps.insert(addr.clone()) {
                     if let Some(peer_id) = addr.extract_peer_id() {
-                        self.swarm.behaviour_mut().add_peer(peer_id, addr);
+                        self.swarm.behaviour_mut().add_peer((peer_id, addr));
                         // the return value of add_address doesn't implement Debug
                         trace!(peer_id=%peer_id, "tried to add a bootstrapper");
                     }
@@ -1601,7 +1427,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                             continue;
                         };
 
-                        if self.swarm.behaviour_mut().add_peer(peer_id, addr.clone()) {
+                        if self.swarm.behaviour_mut().add_peer((peer_id, addr.clone())) {
                             trace!(peer_id=%peer_id, "tried to restore a bootstrapper");
                             // report with the peerid
                             rets.push(original);
@@ -1736,143 +1562,88 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void>> IpfsTask<C> {
                     }
                 }
             }
+            IpfsEvent::RequestStream(protocol, res) => {
+                let Some(rr) = self.swarm.behaviour_mut().request_response(protocol) else {
+                    let _ = res.send(Err(anyhow::anyhow!(
+                        "request-response behaviour is not enabled"
+                    )));
+                    return;
+                };
+                let rx = rr.subscribe();
+                let _ = res.send(Ok(Box::pin(rx)));
+            }
+            IpfsEvent::SendRequest(protocol, peer_id, request, res) => {
+                let Some(rr) = self.swarm.behaviour_mut().request_response(protocol) else {
+                    let _ = res.send(Err(anyhow::anyhow!(
+                        "request-response behaviour is not enabled"
+                    )));
+                    return;
+                };
+
+                let fut = rr.send_request(peer_id, request);
+
+                let _ = res.send(Ok(fut));
+            }
+            IpfsEvent::SendRequests(protocol, peers, request, res) => {
+                let Some(rr) = self.swarm.behaviour_mut().request_response(protocol) else {
+                    let _ = res.send(Err(anyhow::anyhow!(
+                        "request-response behaviour is not enabled"
+                    )));
+                    return;
+                };
+
+                let st = rr.send_requests(peers, request);
+
+                let _ = res.send(Ok(st));
+            }
+            IpfsEvent::SendResponse(protocol, peer_id, id, response, res) => {
+                let Some(rr) = self.swarm.behaviour_mut().request_response(protocol) else {
+                    let _ = res.send(Err(anyhow::anyhow!(
+                        "request-response behaviour is not enabled"
+                    )));
+                    return;
+                };
+
+                let result = rr
+                    .send_response(peer_id, id, response)
+                    .map_err(anyhow::Error::from);
+
+                let _ = res.send(result);
+            }
             IpfsEvent::Exit => {
                 // FIXME: we could do a proper teardown
             }
         }
     }
 
-    #[cfg(feature = "beetle_bitswap")]
     fn handle_repo_event(&mut self, event: RepoEvent) {
         match event {
-            RepoEvent::WantBlock(session, mut cids, peers) => {
-                if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
-                    let client = bitswap.client().clone();
-                    let repo = self.repo.clone();
-                    let (closer_s, mut closer_r) = oneshot::channel();
-                    //If there is no session context defined, we will use 0 as its root context
-                    let ctx = session.unwrap_or(0);
-                    let entry = self.bitswap_sessions.entry(ctx).or_default();
-
-                    let worker = tokio::task::spawn(async move {
-                        let session: beetle_bitswap_next::session::Session =
-                            client.get_or_create_session(ctx).await;
-                        for cid in &cids {
-                            for peer in &peers {
-                                session.add_provider(cid, *peer).await;
-                            }
-                        }
-
-                        let block_stream: beetle_bitswap_next::session::BlockReceiver =
-                            match session.get_blocks(&cids).await {
-                                Ok(bs) => bs,
-                                Err(e) => {
-                                    warn!("Unable to create a block stream for {cids:?}: {e}. Dropping task");
-                                    return;
-                                }
-                            };
-
-                        let (mut blocks, _guard) = block_stream.into_parts();
-
-                        loop {
-                            tokio::select! {
-                                biased;
-                                Some(block) = blocks.next() => {
-                                    let block = match libipld::Block::new(block.cid, block.data.to_vec()) {
-                                        Ok(block) => block,
-                                        Err(e) => {
-                                            error!("Got block {} but failed to validate: {}", block.cid, e);
-                                            continue;
-                                        }
-                                    };
-
-                                    let cid = *block.cid();
-                                    info!("Found {}", cid);
-                                    let res = repo.put_block(block).await;
-                                    if let Err(e) = res {
-                                        error!("Got block {} but failed to store it: {}", cid, e);
-                                    }
-
-                                    cids.retain(|c| c != &cid);
-
-                                    if cids.is_empty() {
-                                        tracing::info!("Resolved all blocks in session {ctx}. Terminating task.");
-                                        drop(_guard);
-                                        break;
-                                    }
-
-                                },
-                                _ = &mut closer_r => {
-                                    // Explicit sesssion stop.
-                                    debug!("session {}: stopped: closed", ctx);
-                                    drop(_guard);
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    entry.push((closer_s, worker));
-                }
-            }
-            RepoEvent::UnwantBlock(_cid) => {}
-            RepoEvent::NewBlock(block) => {
-                if let Some(bitswap) = self.swarm.behaviour().bitswap.as_ref() {
-                    let client = bitswap.client().clone();
-                    let server = bitswap.server().cloned();
-                    tokio::task::spawn(async move {
-                        let block = beetle_bitswap_next::Block::new(
-                            bytes::Bytes::copy_from_slice(block.data()),
-                            *block.cid(),
-                        );
-                        if let Err(err) = client.notify_new_blocks(&[block.clone()]).await {
-                            warn!("failed to notify bitswap about blocks: {:?}", err);
-                        }
-                        if let Some(server) = server {
-                            if let Err(err) = server.notify_new_blocks(&[block]).await {
-                                warn!("failed to notify bitswap about blocks: {:?}", err);
-                            }
-                        }
-                    });
-                }
-                // let _ = ret.send(Err(anyhow!("not actively providing blocks yet")));
-            }
-            RepoEvent::RemovedBlock(cid) => self.swarm.behaviour_mut().stop_providing_block(&cid),
-        }
-    }
-
-    #[cfg(feature = "libp2p_bitswap")]
-    fn handle_repo_event(&mut self, event: RepoEvent) {
-        match event {
-            RepoEvent::WantBlock(_, cids, peers) => {
+            RepoEvent::WantBlock(cids, peers, timeout, signals) => {
                 let Some(bs) = self.swarm.behaviour_mut().bitswap.as_mut() else {
                     return;
                 };
+                if let Some(signals) = signals {
+                    for (cid, signals) in signals {
+                        if signals.is_empty() {
+                            continue;
+                        }
 
-                for cid in cids {
-                    let id = bs.get(cid, peers.iter().copied());
-                    self.bitswap_sessions.insert(id, cid);
+                        let entries = self.bitswap_cancellable.entry(cid).or_default();
+                        entries.extend(signals);
+                    }
                 }
-            }
-            RepoEvent::UnwantBlock(_) => {}
-            RepoEvent::NewBlock(_) => {}
-            RepoEvent::RemovedBlock(_) => {}
-        }
-    }
-
-    #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
-    fn handle_repo_event(&mut self, event: RepoEvent) {
-        match event {
-            RepoEvent::WantBlock(_, cids, peers) => {
-                let Some(bs) = self.swarm.behaviour_mut().bitswap.as_mut() else {
-                    return;
-                };
-                bs.gets(cids, &peers);
+                bs.gets(cids, &peers, timeout);
             }
             RepoEvent::UnwantBlock(cid) => {
                 let Some(bs) = self.swarm.behaviour_mut().bitswap.as_mut() else {
                     return;
                 };
                 bs.cancel(cid);
+                if let Some(list) = self.bitswap_cancellable.remove(&cid) {
+                    for signal in list {
+                        signal.notify_waiters();
+                    }
+                }
             }
             RepoEvent::NewBlock(block) => {
                 let Some(bs) = self.swarm.behaviour_mut().bitswap.as_mut() else {

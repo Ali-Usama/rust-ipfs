@@ -1,37 +1,51 @@
-use std::{path::PathBuf, task::Poll};
+use std::task::Poll;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
 
 use crate::{repo::Repo, Block};
 use bytes::Bytes;
 use either::Either;
+#[allow(unused_imports)]
 use futures::{
     future::BoxFuture,
     stream::{BoxStream, FusedStream},
     FutureExt, Stream, StreamExt, TryFutureExt,
 };
 use rust_unixfs::file::adder::{Chunker, FileAdderBuilder};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, Span};
 
 use crate::{Ipfs, IpfsPath};
 
-use super::{StatusStreamState, UnixfsStatus};
+use super::{TraversalFailed, UnixfsStatus};
 
 pub enum AddOpt {
+    #[cfg(not(target_arch = "wasm32"))]
     File(PathBuf),
     Stream {
         name: Option<String>,
         total: Option<usize>,
-        stream: BoxStream<'static, std::result::Result<Bytes, std::io::Error>>,
+        stream: BoxStream<'static, Result<Bytes, std::io::Error>>,
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<PathBuf> for AddOpt {
     fn from(path: PathBuf) -> Self {
         AddOpt::File(path)
     }
 }
 
-#[must_use = "do nothing unless you `.await` or poll the stream"]
+#[cfg(not(target_arch = "wasm32"))]
+impl From<&Path> for AddOpt {
+    fn from(path: &Path) -> Self {
+        AddOpt::File(path.to_path_buf())
+    }
+}
+
+#[must_use = "does nothing unless you `.await` or poll the stream"]
 pub struct UnixfsAdd {
     core: Option<Either<Ipfs, Repo>>,
     opt: Option<AddOpt>,
@@ -40,7 +54,7 @@ pub struct UnixfsAdd {
     pin: bool,
     provide: bool,
     wrap: bool,
-    stream: StatusStreamState,
+    stream: Option<BoxStream<'static, UnixfsStatus>>,
 }
 
 impl UnixfsAdd {
@@ -62,7 +76,7 @@ impl UnixfsAdd {
             pin: true,
             provide: false,
             wrap: false,
-            stream: StatusStreamState::None,
+            stream: None,
         }
     }
 
@@ -97,10 +111,13 @@ impl Stream for UnixfsAdd {
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    ) -> Poll<Option<Self::Item>> {
+        if self.core.is_none() && self.stream.is_none() {
+            return Poll::Ready(None);
+        }
         loop {
             match &mut self.stream {
-                StatusStreamState::None => {
+                None => {
                     let (ipfs, repo) = match self.core.take().expect("ipfs or repo is used") {
                         Either::Left(ipfs) => {
                             let repo = ipfs.repo().clone();
@@ -120,6 +137,7 @@ impl Stream for UnixfsAdd {
                         let mut written = 0;
 
                         let (name, total_size, mut stream) = match option {
+                            #[cfg(not(target_arch = "wasm32"))]
                             AddOpt::File(path) => match tokio::fs::File::open(path.clone())
                                 .and_then(|file| async move {
                                     let size = file.metadata().await?.len() as usize;
@@ -132,7 +150,7 @@ impl Stream for UnixfsAdd {
                                 }).await {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        yield UnixfsStatus::FailedStatus { written, total_size: None, error: Some(anyhow::Error::from(e)) };
+                                        yield UnixfsStatus::FailedStatus { written, total_size: None, error: e.into() };
                                         return;
                                     }
                                 },
@@ -149,7 +167,7 @@ impl Stream for UnixfsAdd {
                             let buffer = match buffer {
                                 Ok(buf) => buf,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                     return;
                                 }
                             };
@@ -161,14 +179,14 @@ impl Stream for UnixfsAdd {
                                     let block = match Block::new(cid, block) {
                                         Ok(block) => block,
                                         Err(e) => {
-                                            yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                            yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                             return;
                                         }
                                     };
-                                    let _cid = match repo.put_block(block).await {
+                                    let _cid = match repo.put_block(&block).await {
                                         Ok(cid) => cid,
                                         Err(e) => {
-                                            yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                            yield UnixfsStatus::FailedStatus { written, total_size, error: e };
                                             return;
                                         }
                                     };
@@ -187,14 +205,14 @@ impl Stream for UnixfsAdd {
                             let block = match Block::new(cid, block) {
                                 Ok(block) => block,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                     return;
                                 }
                             };
-                            let _cid = match repo.put_block(block).await {
+                            let _cid = match repo.put_block(&block).await {
                                 Ok(cid) => cid,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e };
                                     return;
                                 }
                             };
@@ -204,7 +222,7 @@ impl Stream for UnixfsAdd {
                         let cid = match last_cid {
                             Some(cid) => cid,
                             None => {
-                                yield UnixfsStatus::FailedStatus { written, total_size, error: None };
+                                yield UnixfsStatus::FailedStatus { written, total_size, error: TraversalFailed::Io(std::io::ErrorKind::InvalidData.into()).into() };
                                 return;
                             }
                         };
@@ -226,12 +244,14 @@ impl Stream for UnixfsAdd {
                                         let mut cids = Vec::new();
 
                                         while let Some(node) = iter.next_borrowed() {
+                                            //TODO: Determine best course to prevent additional allocation
                                             let node = node?;
-                                            let block = Block::new(node.cid.to_owned(), node.block.into())?;
+                                            let cid = node.cid.to_owned();
+                                            let block = Block::new(cid, node.block.to_vec())?;
 
-                                            repo.put_block(block).await?;
+                                            repo.put_block(&block).await?;
 
-                                            cids.push(*node.cid);
+                                            cids.push(cid);
                                         }
                                         let cid = cids.last().ok_or(anyhow::anyhow!("no cid available"))?;
                                         let path = IpfsPath::from(*cid).sub_path(&name)?;
@@ -243,7 +263,7 @@ impl Stream for UnixfsAdd {
                                 path = match result.await {
                                     Ok(path) => path,
                                     Err(e) => {
-                                        yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                        yield UnixfsStatus::FailedStatus { written, total_size, error: e };
                                         return;
                                     }
                                 };
@@ -252,11 +272,9 @@ impl Stream for UnixfsAdd {
 
                         let cid = path.root().cid().copied().expect("Cid is apart of the path");
 
-                        if pin {
-                            if let Ok(false) = repo.is_pinned(&cid).await {
-                                if let Err(e) = repo.pin(&cid).recursive().await {
-                                    error!("Unable to pin {cid}: {e}");
-                                }
+                        if pin && !repo.is_pinned(&cid).await.unwrap_or_default() {
+                            if let Err(e) = repo.pin(cid).recursive().await {
+                                error!("Unable to pin {cid}: {e}");
                             }
                         }
 
@@ -272,29 +290,24 @@ impl Stream for UnixfsAdd {
                         yield UnixfsStatus::CompletedStatus { path, written, total_size }
                     };
 
-                    self.stream = StatusStreamState::Pending {
-                        stream: stream.boxed(),
-                    };
+                    self.stream = Some(stream.boxed());
                 }
-                StatusStreamState::Pending { stream } => {
-                    match futures::ready!(stream.poll_next_unpin(cx)) {
-                        Some(item) => {
-                            if matches!(
-                                item,
-                                UnixfsStatus::FailedStatus { .. }
-                                    | UnixfsStatus::CompletedStatus { .. }
-                            ) {
-                                self.stream = StatusStreamState::Done;
-                            }
-                            return Poll::Ready(Some(item));
+                Some(stream) => match futures::ready!(stream.poll_next_unpin(cx)) {
+                    Some(item) => {
+                        if matches!(
+                            item,
+                            UnixfsStatus::FailedStatus { .. }
+                                | UnixfsStatus::CompletedStatus { .. }
+                        ) {
+                            self.stream.take();
                         }
-                        None => {
-                            self.stream = StatusStreamState::Done;
-                            return Poll::Ready(None);
-                        }
+                        return Poll::Ready(Some(item));
                     }
-                }
-                StatusStreamState::Done => return Poll::Ready(None),
+                    None => {
+                        self.stream.take();
+                        return Poll::Ready(None);
+                    }
+                },
             }
         }
     }
@@ -312,7 +325,7 @@ impl std::future::IntoFuture for UnixfsAdd {
                 match status {
                     UnixfsStatus::CompletedStatus { path, .. } => return Ok(path),
                     UnixfsStatus::FailedStatus { error, .. } => {
-                        return Err(error.unwrap_or(anyhow::anyhow!("Unable to add file")));
+                        return Err(error);
                     }
                     _ => {}
                 }
@@ -326,6 +339,6 @@ impl std::future::IntoFuture for UnixfsAdd {
 
 impl FusedStream for UnixfsAdd {
     fn is_terminated(&self) -> bool {
-        matches!(self.stream, StatusStreamState::Done) && self.core.is_none()
+        self.stream.is_none() && self.core.is_none()
     }
 }

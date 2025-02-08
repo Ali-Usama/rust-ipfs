@@ -1,8 +1,3 @@
-use std::{
-    collections::VecDeque,
-    task::{Context, Poll},
-};
-
 use libp2p::{
     core::upgrade::DeniedUpgrade,
     swarm::{
@@ -11,7 +6,10 @@ use libp2p::{
     },
     StreamProtocol,
 };
-use void::Void;
+use std::{
+    collections::VecDeque,
+    task::{Context, Poll},
+};
 
 #[allow(clippy::type_complexity)]
 #[allow(deprecated)]
@@ -34,12 +32,12 @@ pub enum Out {
 
 #[allow(deprecated)]
 impl ConnectionHandler for Handler {
-    type FromBehaviour = Void;
+    type FromBehaviour = ();
     type ToBehaviour = Out;
     type InboundProtocol = DeniedUpgrade;
     type OutboundProtocol = DeniedUpgrade;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = Void;
+    type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(DeniedUpgrade, ())

@@ -10,6 +10,7 @@ use std::{
 
 use futures::StreamExt;
 use futures_timer::Delay;
+use libp2p::core::transport::PortUse;
 use libp2p::{
     core::Endpoint,
     multiaddr::Protocol,
@@ -46,7 +47,7 @@ pub enum Event {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Connection {
     pub peer_id: PeerId,
     pub id: ConnectionId,
@@ -55,7 +56,7 @@ struct Connection {
     pub rtt: Option<[Duration; 3]>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Candidate {
     Pending,
     Unsupported,
@@ -73,6 +74,7 @@ impl PartialEq for Connection {
 
 impl Eq for Connection {}
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingReservation {
     peer_id: PeerId,
@@ -269,27 +271,41 @@ impl Behaviour {
             return;
         }
 
-        let mut blacklist = Vec::new();
+        let mut temp_connections = connections.clone();
         let mut rng = rand::thread_rng();
         let connection = loop {
-            let connection = connections
-                .choose_mut(&mut rng)
-                .expect("Connections to be available");
-
-            if blacklist.contains(&connection.id) {
-                continue;
+            if temp_connections.is_empty() {
+                self.events
+                    .push_back(ToSwarm::GenerateEvent(Event::ReservationFailure {
+                        peer_id,
+                        result: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "no qualified connections available",
+                        )),
+                    }));
+                return;
             }
+
+            let connection = temp_connections
+                .choose(&mut rng)
+                .cloned()
+                .expect("Connection available");
 
             if let Candidate::Confirmed {
                 listener_id: Some(_),
                 ..
             } = connection.candidacy
             {
-                blacklist.push(connection.id);
+                // If the candidate is confirmed, remove it from the temporary connection
+                // and try another random connection, if any is available
+                temp_connections.retain(|c| c.id != connection.id);
                 continue;
             }
 
-            break connection;
+            break connections
+                .iter_mut()
+                .find(|c| c.id == connection.id)
+                .expect("Connection available");
         };
 
         if matches!(connection.candidacy, Candidate::Pending) {
@@ -752,6 +768,7 @@ impl NetworkBehaviour for Behaviour {
         _peer: PeerId,
         _addr: &Multiaddr,
         _role_override: Endpoint,
+        _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(handler::Handler::default())
     }

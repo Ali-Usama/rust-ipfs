@@ -1,16 +1,18 @@
 use crate::error::Error;
 use crate::p2p::DnsResolver;
 use crate::path::IpfsPath;
-use std::str::FromStr;
+
 use tracing_futures::Instrument;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn resolve<'a>(
     resolver: DnsResolver,
     domain: &str,
     mut path: impl Iterator<Item = &'a str>,
 ) -> Result<IpfsPath, Error> {
-    use hickory_resolver::AsyncResolver;
+    use hickory_resolver::Resolver;
     use std::borrow::Cow;
+    use std::str::FromStr;
 
     let span = tracing::trace_span!("dnslink", %domain);
 
@@ -34,7 +36,7 @@ pub async fn resolve<'a>(
         // when trust-dns support lands in future libp2p-dns investigate if we could share one, no need
         // to have multiple related caches.
         let (config, opt) = resolver.into();
-        let resolver = AsyncResolver::tokio(config, opt);
+        let resolver = Resolver::tokio(config, opt);
 
         // previous implementation searched $domain and _dnslink.$domain concurrently. not sure did
         // `domain` assume fqdn names or not, but local suffices were not being searched on windows at
@@ -82,6 +84,18 @@ pub async fn resolve<'a>(
     }
     .instrument(span)
     .await
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn resolve<'a>(
+    _: DnsResolver,
+    domain: &str,
+    _: impl Iterator<Item = &'a str>,
+) -> Result<IpfsPath, Error> {
+    let span = tracing::trace_span!("dnslink", %domain);
+    async move { anyhow::bail!("failed to resolve {domain}: unimplemented") }
+        .instrument(span)
+        .await
 }
 
 #[cfg(test)]

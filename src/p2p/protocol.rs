@@ -1,8 +1,4 @@
-use std::{
-    collections::VecDeque,
-    task::{Context, Poll},
-};
-
+use libp2p::core::transport::PortUse;
 use libp2p::{
     core::Endpoint,
     swarm::{
@@ -10,6 +6,11 @@ use libp2p::{
         THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId, StreamProtocol,
+};
+use std::convert::Infallible;
+use std::{
+    collections::VecDeque,
+    task::{Context, Poll},
 };
 
 mod handler;
@@ -28,7 +29,7 @@ impl Behaviour {
 
 impl NetworkBehaviour for Behaviour {
     type ConnectionHandler = handler::Handler;
-    type ToSwarm = void::Void;
+    type ToSwarm = Infallible;
 
     fn handle_pending_inbound_connection(
         &mut self,
@@ -65,6 +66,7 @@ impl NetworkBehaviour for Behaviour {
         _: PeerId,
         _: &Multiaddr,
         _: Endpoint,
+        _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(handler::Handler::default())
     }

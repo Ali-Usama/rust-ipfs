@@ -22,6 +22,7 @@
 // the docs better.
 //#![allow(private_intra_doc_links)]
 
+pub mod block;
 pub mod config;
 pub mod dag;
 pub mod error;
@@ -34,6 +35,7 @@ pub mod repo;
 mod task;
 pub mod unixfs;
 
+pub use block::Block;
 #[macro_use]
 extern crate tracing;
 
@@ -52,43 +54,30 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 
+use indexmap::IndexSet;
 use keystore::Keystore;
 
-#[cfg(feature = "beetle_bitswap")]
-use p2p::BitswapConfig;
-
 use p2p::{
-    IdentifyConfiguration, KadConfig, KadStoreConfig, PeerInfo, PubsubConfig, RelayConfig,
-    SwarmConfig, TransportConfig,
+    IdentifyConfiguration, KadConfig, KadStoreConfig, MultiaddrExt, PeerInfo, PubsubConfig,
+    RelayConfig, RequestResponseConfig, SwarmConfig, TransportConfig,
 };
 use repo::{
     BlockStore, DataStore, GCConfig, GCTrigger, Lock, RepoFetch, RepoInsertPin, RepoRemovePin,
 };
-use tokio::task::JoinHandle;
-use tokio_util::sync::{CancellationToken, DropGuard};
+
 use tracing::Span;
 use tracing_futures::Instrument;
-use unixfs::{AddOpt, IpfsUnixfs, UnixfsAdd, UnixfsCat, UnixfsGet, UnixfsLs};
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    fmt,
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
-    sync::atomic::AtomicU64,
-    sync::Arc,
-    time::Duration,
-};
+use unixfs::UnixfsGet;
+use unixfs::{AddOpt, IpfsUnixfs, UnixfsAdd, UnixfsCat, UnixfsLs};
 
+pub use self::p2p::gossipsub::SubscriptionStream;
 use self::{
     dag::IpldDag,
     ipns::Ipns,
     p2p::{create_swarm, TSwarm},
     repo::Repo,
 };
-
-pub use self::p2p::gossipsub::SubscriptionStream;
-
 pub use self::{
     error::Error,
     p2p::BehaviourEvent,
@@ -96,10 +85,19 @@ pub use self::{
     path::IpfsPath,
     repo::{PinKind, PinMode},
 };
-
-pub type Block = libipld::Block<libipld::DefaultParams>;
-
-use libipld::{Cid, Ipld};
+use async_rt::AbortableJoinHandle;
+use ipld_core::cid::Cid;
+use ipld_core::ipld::Ipld;
+use std::borrow::Borrow;
+use std::convert::Infallible;
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+    ops::{Deref, DerefMut},
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 pub use libp2p::{
     self,
@@ -114,6 +112,7 @@ pub use libp2p::{
     Multiaddr, PeerId,
 };
 
+use libp2p::swarm::ConnectionId;
 use libp2p::{
     core::{muxing::StreamMuxerBox, transport::Boxed},
     kad::{store::MemoryStoreConfig, Mode, Record},
@@ -122,14 +121,22 @@ use libp2p::{
     swarm::dial_opts::DialOpts,
     StreamProtocol,
 };
+use libp2p::{request_response::InboundRequestId, swarm::dial_opts::PeerCondition};
+pub use libp2p_connection_limits::ConnectionLimits;
+use serde::Serialize;
 
-pub(crate) static BITSWAP_ID: AtomicU64 = AtomicU64::new(1);
+#[allow(dead_code)]
+#[deprecated(note = "Use `StoreageType` instead")]
+type StoragePath = StorageType;
 
 #[derive(Default, Debug)]
-pub enum StoragePath {
-    Disk(PathBuf),
+pub enum StorageType {
+    #[cfg(not(target_arch = "wasm32"))]
+    Disk(std::path::PathBuf),
     #[default]
     Memory,
+    #[cfg(target_arch = "wasm32")]
+    IndexedDb { namespace: Option<String> },
     Custom {
         blockstore: Option<Box<dyn BlockStore>>,
         datastore: Option<Box<dyn DataStore>>,
@@ -137,14 +144,20 @@ pub enum StoragePath {
     },
 }
 
-impl PartialEq for StoragePath {
+impl PartialEq for StorageType {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (StoragePath::Disk(left_path), StoragePath::Disk(right_path)) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            (StorageType::Disk(left_path), StorageType::Disk(right_path)) => {
                 left_path.eq(right_path)
             }
-            (StoragePath::Memory, StoragePath::Memory) => true,
-            (StoragePath::Custom { .. }, StoragePath::Custom { .. }) => {
+            #[cfg(target_arch = "wasm32")]
+            (
+                StorageType::IndexedDb { namespace: left },
+                StorageType::IndexedDb { namespace: right },
+            ) => left.eq(right),
+            (StorageType::Memory, StorageType::Memory) => true,
+            (StorageType::Custom { .. }, StorageType::Custom { .. }) => {
                 //Do we really care if they equal?
                 //TODO: Possibly implement PartialEq/Eq for the traits so we could make sure
                 //      that they do or dont eq each other. For now this will always be true
@@ -155,10 +168,10 @@ impl PartialEq for StoragePath {
     }
 }
 
-impl Eq for StoragePath {}
+impl Eq for StorageType {}
 
 /// Ipfs node options used to configure the node to be created with [`UninitializedIpfs`].
-pub struct IpfsOptions {
+struct IpfsOptions {
     /// The path of the ipfs repo (blockstore and datastore).
     ///
     /// This is always required but can be any path with in-memory backends. The filesystem backend
@@ -168,14 +181,10 @@ pub struct IpfsOptions {
     ///
     /// It is **not** recommended to set this to IPFS_PATH without first at least backing up your
     /// existing repository.
-    pub ipfs_path: StoragePath,
+    pub ipfs_path: StorageType,
 
     /// Nodes used as bootstrap peers.
     pub bootstrap: Vec<Multiaddr>,
-
-    #[cfg(feature = "beetle_bitswap")]
-    /// Bitswap configuration
-    pub bitswap_config: BitswapConfig,
 
     /// Relay server config
     pub relay_server_config: RelayConfig,
@@ -194,6 +203,9 @@ pub struct IpfsOptions {
 
     /// Pubsub configuration
     pub pubsub_config: crate::p2p::PubsubConfig,
+
+    /// Request Response configuration
+    pub request_response_config: Either<RequestResponseConfig, Vec<RequestResponseConfig>>,
 
     /// Kad configuration
     pub kad_configuration: Either<KadConfig, libp2p::kad::Config>,
@@ -223,6 +235,11 @@ pub struct IpfsOptions {
     /// default is useful when running multiple nodes.
     pub span: Option<Span>,
 
+    pub connection_limits: Option<ConnectionLimits>,
+
+    /// Channel capacity for emitting connection events over.
+    pub connection_event_cap: usize,
+
     pub(crate) protocols: Libp2pProtocol,
 }
 
@@ -234,15 +251,18 @@ pub(crate) struct Libp2pProtocol {
     pub(crate) relay_client: bool,
     pub(crate) relay_server: bool,
     pub(crate) dcutr: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) mdns: bool,
     pub(crate) identify: bool,
     pub(crate) autonat: bool,
     pub(crate) rendezvous_client: bool,
     pub(crate) rendezvous_server: bool,
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) upnp: bool,
     pub(crate) ping: bool,
     #[cfg(feature = "experimental_stream")]
     pub(crate) streams: bool,
+    pub(crate) request_response: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -264,10 +284,8 @@ pub enum RepoProvider {
 impl Default for IpfsOptions {
     fn default() -> Self {
         Self {
-            ipfs_path: StoragePath::Memory,
+            ipfs_path: StorageType::Memory,
             bootstrap: Default::default(),
-            #[cfg(feature = "beetle_bitswap")]
-            bitswap_config: Default::default(),
             relay_server_config: Default::default(),
             kad_configuration: Either::Left(Default::default()),
             kad_store_config: Default::default(),
@@ -277,12 +295,15 @@ impl Default for IpfsOptions {
             provider: Default::default(),
             keystore: Keystore::in_memory(),
             connection_idle: Duration::from_secs(30),
+            request_response_config: Either::Left(Default::default()),
             listening_addrs: vec![],
             transport_configuration: TransportConfig::default(),
             pubsub_config: PubsubConfig::default(),
             swarm_configuration: SwarmConfig::default(),
+            connection_event_cap: 256,
             span: None,
             protocols: Default::default(),
+            connection_limits: None,
         }
     }
 }
@@ -317,7 +338,8 @@ pub struct Ipfs {
     identify_conf: IdentifyConfiguration,
     to_task: Sender<IpfsEvent>,
     record_key_validator: HashMap<String, Arc<dyn Fn(&str) -> anyhow::Result<Key> + Sync + Send>>,
-    _guard: Arc<DropGuard>,
+    _guard: AbortableJoinHandle<()>,
+    _gc_guard: AbortableJoinHandle<()>,
 }
 
 impl std::fmt::Debug for Ipfs {
@@ -334,7 +356,7 @@ type ReceiverChannel<T> = oneshot::Receiver<Result<T, Error>>;
 #[allow(clippy::type_complexity)]
 enum IpfsEvent {
     /// Connect
-    Connect(DialOpts, Channel<()>),
+    Connect(DialOpts, Channel<ConnectionId>),
     /// Node supported protocol
     Protocol(OneshotSender<Vec<String>>),
     /// Addresses
@@ -362,8 +384,15 @@ enum IpfsEvent {
     PubsubSubscribed(Channel<Vec<String>>),
     AddListeningAddress(Multiaddr, Channel<Multiaddr>),
     RemoveListeningAddress(Multiaddr, Channel<()>),
+    AddExternalAddress(Multiaddr, Channel<()>),
+    RemoveExternalAddress(Multiaddr, Channel<()>),
+    ConnectionEvents(Channel<futures::channel::mpsc::Receiver<ConnectionEvents>>),
+    PeerConnectionEvents(
+        PeerId,
+        Channel<futures::channel::mpsc::Receiver<PeerConnectionEvents>>,
+    ),
     Bootstrap(Channel<ReceiverChannel<KadResult>>),
-    AddPeer(PeerId, Multiaddr, Channel<()>),
+    AddPeer(AddPeerOpt, Channel<()>),
     RemovePeer(PeerId, Option<Multiaddr>, Channel<bool>),
     GetClosestPeers(PeerId, Channel<ReceiverChannel<KadResult>>),
     FindPeerIdentity(PeerId, Channel<ReceiverChannel<libp2p::identify::Info>>),
@@ -372,8 +401,8 @@ enum IpfsEvent {
         bool,
         Channel<Either<Vec<Multiaddr>, ReceiverChannel<KadResult>>>,
     ),
-    GetProviders(Cid, Channel<Option<BoxStream<'static, PeerId>>>),
-    Provide(Cid, Channel<ReceiverChannel<KadResult>>),
+    GetProviders(Key, Channel<Option<BoxStream<'static, PeerId>>>),
+    Provide(Key, Channel<ReceiverChannel<KadResult>>),
     DhtMode(DhtMode, Channel<()>),
     DhtGet(Key, Channel<BoxStream<'static, Record>>),
     DhtPut(Key, Vec<u8>, Quorum, Channel<ReceiverChannel<KadResult>>),
@@ -382,7 +411,29 @@ enum IpfsEvent {
     RemoveBootstrapper(Multiaddr, Channel<Multiaddr>),
     ClearBootstrappers(Channel<Vec<Multiaddr>>),
     DefaultBootstrap(Channel<Vec<Multiaddr>>),
-
+    RequestStream(
+        Option<StreamProtocol>,
+        Channel<BoxStream<'static, (PeerId, InboundRequestId, Bytes)>>,
+    ),
+    SendRequest(
+        Option<StreamProtocol>,
+        PeerId,
+        Bytes,
+        Channel<BoxFuture<'static, std::io::Result<Bytes>>>,
+    ),
+    SendRequests(
+        Option<StreamProtocol>,
+        IndexSet<PeerId>,
+        Bytes,
+        Channel<BoxStream<'static, (PeerId, std::io::Result<Bytes>)>>,
+    ),
+    SendResponse(
+        Option<StreamProtocol>,
+        PeerId,
+        InboundRequestId,
+        Bytes,
+        Channel<()>,
+    ),
     AddRelay(PeerId, Multiaddr, Channel<()>),
     RemoveRelay(PeerId, Multiaddr, Channel<()>),
     EnableRelay(Option<PeerId>, Channel<()>),
@@ -425,13 +476,19 @@ impl From<DhtMode> for Option<Mode> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PubsubEvent {
     /// Subscription event to a given topic
-    Subscribe { peer_id: PeerId },
+    Subscribe {
+        peer_id: PeerId,
+        topic: Option<String>,
+    },
 
     /// Unsubscribing event to a given topic
-    Unsubscribe { peer_id: PeerId },
+    Unsubscribe {
+        peer_id: PeerId,
+        topic: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -441,15 +498,6 @@ pub(crate) enum InnerPubsubEvent {
 
     /// Unsubscribing event to a given topic
     Unsubscribe { topic: String, peer_id: PeerId },
-}
-
-impl From<InnerPubsubEvent> for PubsubEvent {
-    fn from(event: InnerPubsubEvent) -> Self {
-        match event {
-            InnerPubsubEvent::Subscribe { peer_id, .. } => PubsubEvent::Subscribe { peer_id },
-            InnerPubsubEvent::Unsubscribe { peer_id, .. } => PubsubEvent::Unsubscribe { peer_id },
-        }
-    }
 }
 
 type TSwarmEvent<C> = <TSwarm<C> as Stream>::Item;
@@ -470,9 +518,42 @@ pub enum FDLimit {
     Custom(u64),
 }
 
+#[derive(Debug, Clone)]
+pub enum PeerConnectionEvents {
+    IncomingConnection {
+        connection_id: ConnectionId,
+        addr: Multiaddr,
+    },
+    OutgoingConnection {
+        connection_id: ConnectionId,
+        addr: Multiaddr,
+    },
+    ClosedConnection {
+        connection_id: ConnectionId,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ConnectionEvents {
+    IncomingConnection {
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        addr: Multiaddr,
+    },
+    OutgoingConnection {
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        addr: Multiaddr,
+    },
+    ClosedConnection {
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    },
+}
+
 /// Configured Ipfs which can only be started.
 #[allow(clippy::type_complexity)]
-pub struct UninitializedIpfs<C: NetworkBehaviour<ToSwarm = void::Void> + Send> {
+pub struct UninitializedIpfs<C: NetworkBehaviour<ToSwarm = Infallible> + Send> {
     keys: Option<Keypair>,
     options: IpfsOptions,
     fdlimit: Option<FDLimit>,
@@ -487,15 +568,15 @@ pub struct UninitializedIpfs<C: NetworkBehaviour<ToSwarm = void::Void> + Send> {
     gc_repo_duration: Option<Duration>,
 }
 
-pub type UninitializedIpfsNoop = UninitializedIpfs<libp2p::swarm::dummy::Behaviour>;
+pub type UninitializedIpfsDefault = UninitializedIpfs<libp2p::swarm::dummy::Behaviour>;
 
-impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> Default for UninitializedIpfs<C> {
+impl<C: NetworkBehaviour<ToSwarm = Infallible> + Send> Default for UninitializedIpfs<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
+impl<C: NetworkBehaviour<ToSwarm = Infallible> + Send> UninitializedIpfs<C> {
     /// New uninitualized instance
     pub fn new() -> Self {
         UninitializedIpfs {
@@ -514,29 +595,6 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         }
     }
 
-    /// New uninitualized instance without any listener addresses
-    #[deprecated(
-        note = "UninitializedIpfs::empty will be removed in the future. Use UninitializedIpfs::new()"
-    )]
-    pub fn empty() -> Self {
-        Self::new()
-    }
-
-    /// Configures a new UninitializedIpfs with from the given options and optionally a span.
-    /// If the span is not given, it is defaulted to `tracing::trace_span!("ipfs")`.
-    ///
-    /// The span is attached to all operations called on the later created `Ipfs` along with all
-    /// operations done in the background task as well as tasks spawned by the underlying
-    /// `libp2p::Swarm`.
-    #[deprecated(
-        note = "UninitializedIpfs::with_opt will be removed in the future. Use UninitializedIpfs::new()"
-    )]
-    pub fn with_opt(options: IpfsOptions) -> Self {
-        let mut opt = Self::new();
-        opt.options = options;
-        opt
-    }
-
     /// Set default listening unspecified ipv4 and ipv6 addresseses for tcp and udp/quic
     pub fn set_default_listener(self) -> Self {
         self.add_listening_addrs(vec![
@@ -545,11 +603,29 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         ])
     }
 
+    /// Set storage type for the repo.
+    pub fn set_storage_type(mut self, storage_type: StorageType) -> Self {
+        self.options.ipfs_path = storage_type;
+        self
+    }
+
     /// Adds a listening address
     pub fn add_listening_addr(mut self, addr: Multiaddr) -> Self {
         if !self.options.listening_addrs.contains(&addr) {
             self.options.listening_addrs.push(addr)
         }
+        self
+    }
+
+    /// Set a connection limit
+    pub fn set_connection_limits(mut self, connection_limits: ConnectionLimits) -> Self {
+        self.options.connection_limits.replace(connection_limits);
+        self
+    }
+
+    /// Set connection event capacity
+    pub fn set_connection_event_capacity(mut self, cap: usize) -> Self {
+        self.options.connection_event_cap = cap;
         self
     }
 
@@ -573,29 +649,6 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         self
     }
 
-    #[cfg(feature = "beetle_bitswap")]
-    /// Load default behaviour for basic functionality
-    pub fn with_default(self) -> Self {
-        self.with_identify(Default::default())
-            .with_autonat()
-            .with_bitswap(Default::default())
-            .with_kademlia(Either::Left(Default::default()), Default::default())
-            .with_ping(Default::default())
-            .with_pubsub(Default::default())
-    }
-
-    #[cfg(feature = "libp2p_bitswap")]
-    /// Load default behaviour for basic functionality
-    pub fn with_default(self) -> Self {
-        self.with_identify(Default::default())
-            .with_autonat()
-            .with_bitswap()
-            .with_kademlia(Either::Left(Default::default()), Default::default())
-            .with_ping(Default::default())
-            .with_pubsub(Default::default())
-    }
-
-    #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
     /// Load default behaviour for basic functionality
     pub fn with_default(self) -> Self {
         self.with_identify(Default::default())
@@ -619,22 +672,6 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         self
     }
 
-    #[cfg(feature = "beetle_bitswap")]
-    /// Enables bitswap
-    pub fn with_bitswap(mut self, config: BitswapConfig) -> Self {
-        self.options.protocols.bitswap = true;
-        self.options.bitswap_config = config;
-        self
-    }
-
-    #[cfg(feature = "libp2p_bitswap")]
-    /// Enables bitswap
-    pub fn with_bitswap(mut self) -> Self {
-        self.options.protocols.bitswap = true;
-        self
-    }
-
-    #[cfg(not(any(feature = "libp2p_bitswap", feature = "beetle_bitswap")))]
     /// Enables bitswap
     pub fn with_bitswap(mut self) -> Self {
         self.options.protocols.bitswap = true;
@@ -642,6 +679,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
     }
 
     /// Enable mdns
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_mdns(mut self) -> Self {
         self.options.protocols.mdns = true;
         self
@@ -662,6 +700,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
     }
 
     /// Enable port mapping (AKA UPnP)
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_upnp(mut self) -> Self {
         self.options.protocols.upnp = true;
         self
@@ -699,6 +738,24 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
         self
     }
 
+    /// Enables request response.
+    /// Note: At this time, this option will only support up to 10 request-response behaviours.
+    ///       with any additional being ignored. Additionally, any duplicated protocols that are
+    ///       provided will be ignored.
+    pub fn with_request_response(mut self, mut config: Vec<RequestResponseConfig>) -> Self {
+        debug_assert!(config.len() < 10);
+        self.options.protocols.request_response = true;
+        let cfg = match config.is_empty() {
+            true => Either::Left(Default::default()),
+            false if config.len() == 1 => Either::Left(config.remove(0)),
+            false => Either::Right(config),
+        };
+
+        self.options.request_response_config = cfg;
+
+        self
+    }
+
     /// Enables autonat
     pub fn with_autonat(mut self) -> Self {
         self.options.protocols.autonat = true;
@@ -732,9 +789,10 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
     }
 
     /// Sets a path
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn set_path<P: AsRef<Path>>(mut self, path: P) -> Self {
         let path = path.as_ref().to_path_buf();
-        self.options.ipfs_path = StoragePath::Disk(path);
+        self.options.ipfs_path = StorageType::Disk(path);
         self
     }
 
@@ -882,7 +940,8 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
                 repo
             }
             None => {
-                if let StoragePath::Disk(path) = &options.ipfs_path {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let StorageType::Disk(path) = &options.ipfs_path {
                     if !path.is_dir() {
                         tokio::fs::create_dir_all(path).await?;
                     }
@@ -917,15 +976,15 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
             }
         }
 
-        let token = CancellationToken::new();
-        let _guard = Arc::new(token.clone().drop_guard());
+        let mut _guard = AbortableJoinHandle::empty();
+        let mut _gc_guard = AbortableJoinHandle::empty();
 
         let (to_task, receiver) = channel::<IpfsEvent>(1);
         let id_conf = options.identify_configuration.clone();
 
         let keystore = options.keystore.clone();
 
-        let ipfs = Ipfs {
+        let mut ipfs = Ipfs {
             span: facade_span,
             repo,
             identify_conf: id_conf,
@@ -934,6 +993,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
             to_task,
             record_key_validator,
             _guard,
+            _gc_guard,
         };
 
         //Note: If `All` or `Pinned` are used, we would have to auto adjust the amount of
@@ -980,18 +1040,15 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
             &ipfs.repo,
             exec_span,
             (custom_behaviour, custom_transport),
-        )
-        .instrument(tracing::trace_span!(parent: &init_span, "swarm"))
-        .await?;
+        )?;
 
         let IpfsOptions {
             listening_addrs, ..
         } = options;
 
-        if let Some(config) = gc_config {
-            tokio::spawn({
+        let gc_handle = gc_config.map(|config| {
+            async_rt::task::spawn_abortable({
                 let repo = ipfs.repo.clone();
-                let token = token.clone();
                 async move {
                     let GCConfig { duration, trigger } = config;
                     let use_config_timer = duration != Duration::ZERO;
@@ -1005,16 +1062,11 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
                         false => Duration::from_secs(60 * 60),
                     };
 
-                    let mut interval =
-                        tokio::time::interval_at(tokio::time::Instant::now() + time, time);
+                    let mut interval = futures_timer::Delay::new(time);
 
                     loop {
                         tokio::select! {
-                            _ = token.cancelled() => {
-                                tracing::debug!("gc task cancelled");
-                                break
-                            },
-                            _ = interval.tick() => {
+                            _ = &mut interval => {
                                 let _g = repo.inner.gclock.write().await;
                                 tracing::debug!("preparing gc operation");
                                 let pinned = repo
@@ -1056,14 +1108,22 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
                                     tracing::debug!(removed_blocks = blocks.len(), "blocks removed");
                                     tracing::debug!("cleanup finished");
                                 }
+
+                                interval.reset(time);
                             }
                         }
                     }
                 }
-            });
-        }
+            })
+        }).unwrap_or(AbortableJoinHandle::empty());
 
-        let mut fut = task::IpfsTask::new(swarm, repo_events.fuse(), receiver.fuse(), &ipfs.repo);
+        let mut fut = task::IpfsTask::new(
+            swarm,
+            repo_events.fuse(),
+            receiver.fuse(),
+            &ipfs.repo,
+            options.connection_event_cap,
+        );
         fut.swarm_event = swarm_event;
         fut.local_external_addr = local_external_addr;
 
@@ -1093,7 +1153,7 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
             }
         }
 
-        tokio::spawn({
+        let main_handle = async_rt::task::spawn_abortable({
             async move {
                 //Note: For now this is not configurable as its meant for internal testing purposes but may change in the future
                 let as_fut = false;
@@ -1104,13 +1164,15 @@ impl<C: NetworkBehaviour<ToSwarm = void::Void> + Send> UninitializedIpfs<C> {
                     fut.run().boxed()
                 };
 
-                tokio::select! {
-                    _ = fut => {}
-                    _ = token.cancelled() => {},
-                };
+                fut.await
             }
             .instrument(swarm_span)
         });
+
+        unsafe {
+            ipfs._guard.replace(main_handle);
+            ipfs._gc_guard.replace(gc_handle);
+        }
         Ok(ipfs)
     }
 }
@@ -1137,26 +1199,24 @@ impl Ipfs {
     }
 
     /// Puts a block into the ipfs repo.
-    pub async fn put_block(&self, block: Block) -> Result<Cid, Error> {
-        self.repo
-            .put_block(block)
-            .instrument(self.span.clone())
-            .await
+    pub fn put_block(&self, block: &Block) -> RepoPutBlock {
+        self.repo.put_block(block).span(self.span.clone())
     }
 
     /// Retrieves a block from the local blockstore, or starts fetching from the network or join an
     /// already started fetch.
-    pub async fn get_block(&self, cid: &Cid) -> Result<Block, Error> {
-        self.repo
-            .get_block(cid, &[], false)
-            .instrument(self.span.clone())
-            .await
+    pub fn get_block(&self, cid: impl Borrow<Cid>) -> RepoGetBlock {
+        self.repo.get_block(cid).span(self.span.clone())
     }
 
     /// Remove block from the ipfs repo. A pinned block cannot be removed.
-    pub async fn remove_block(&self, cid: Cid, recursive: bool) -> Result<Vec<Cid>, Error> {
+    pub async fn remove_block(
+        &self,
+        cid: impl Borrow<Cid>,
+        recursive: bool,
+    ) -> Result<Vec<Cid>, Error> {
         self.repo
-            .remove_block(&cid, recursive)
+            .remove_block(cid, recursive)
             .instrument(self.span.clone())
             .await
     }
@@ -1187,7 +1247,7 @@ impl Ipfs {
     /// If a recursive `insert_pin` operation is interrupted because of a crash or the crash
     /// prevents from synchronizing the data store to disk, this will leave the system in an inconsistent
     /// state. The remedy is to re-pin recursive pins.
-    pub fn insert_pin(&self, cid: &Cid) -> RepoInsertPin {
+    pub fn insert_pin(&self, cid: impl Borrow<Cid>) -> RepoInsertPin {
         self.repo().pin(cid).span(self.span.clone())
     }
 
@@ -1197,7 +1257,7 @@ impl Ipfs {
     ///
     /// Unpinning an indirectly pinned Cid is not possible other than through its recursively
     /// pinned tree roots.
-    pub fn remove_pin(&self, cid: &Cid) -> RepoRemovePin {
+    pub fn remove_pin(&self, cid: impl Borrow<Cid>) -> RepoRemovePin {
         self.repo().remove_pin(cid).span(self.span.clone())
     }
 
@@ -1214,8 +1274,8 @@ impl Ipfs {
     /// Works correctly only under no-crash situations. Workaround for hitting a crash is to re-pin
     /// any existing recursive pins.
     ///
-    pub async fn is_pinned(&self, cid: &Cid) -> Result<bool, Error> {
-        let span = debug_span!(parent: &self.span, "is_pinned", cid = %cid);
+    pub async fn is_pinned(&self, cid: impl Borrow<Cid>) -> Result<bool, Error> {
+        let span = debug_span!(parent: &self.span, "is_pinned", cid = %cid.borrow());
         self.repo.is_pinned(cid).instrument(span).await
     }
 
@@ -1227,7 +1287,7 @@ impl Ipfs {
     pub async fn list_pins(
         &self,
         filter: Option<PinMode>,
-    ) -> futures::stream::BoxStream<'static, Result<(Cid, PinMode), Error>> {
+    ) -> BoxStream<'static, Result<(Cid, PinMode), Error>> {
         let span = debug_span!(parent: &self.span, "list_pins", ?filter);
         self.repo.list_pins(filter).instrument(span).await
     }
@@ -1253,14 +1313,14 @@ impl Ipfs {
     /// Puts an ipld node into the ipfs repo using `dag-cbor` codec and Sha2_256 hash.
     ///
     /// Returns Cid version 1 for the document
-    pub fn put_dag(&self, ipld: Ipld) -> DagPut {
+    pub fn put_dag(&self, ipld: impl Serialize) -> DagPut {
         self.dag().put_dag(ipld).span(self.span.clone())
     }
 
     /// Gets an ipld node from the ipfs, fetching the block if necessary.
     ///
     /// See [`IpldDag::get`] for more information.
-    pub fn get_dag<I: Into<IpfsPath>>(&self, path: I) -> DagGet {
+    pub fn get_dag(&self, path: impl Into<IpfsPath>) -> DagGet {
         self.dag().get_dag(path).span(self.span.clone())
     }
 
@@ -1277,17 +1337,21 @@ impl Ipfs {
     }
 
     /// Retreive a file and saving it to a path.
-    pub fn get_unixfs<P: AsRef<Path>>(&self, path: IpfsPath, dest: P) -> UnixfsGet {
+    pub fn get_unixfs(&self, path: impl Into<IpfsPath>, dest: impl AsRef<Path>) -> UnixfsGet {
         self.unixfs().get(path, dest).span(self.span.clone())
     }
 
     /// List directory contents
-    pub fn ls_unixfs(&self, path: IpfsPath) -> UnixfsLs {
+    pub fn ls_unixfs(&self, path: impl Into<IpfsPath>) -> UnixfsLs {
         self.unixfs().ls(path).span(self.span.clone())
     }
 
     /// Resolves a ipns path to an ipld path; currently only supports dht and dnslink resolution.
-    pub async fn resolve_ipns(&self, path: &IpfsPath, recursive: bool) -> Result<IpfsPath, Error> {
+    pub async fn resolve_ipns(
+        &self,
+        path: impl Borrow<IpfsPath>,
+        recursive: bool,
+    ) -> Result<IpfsPath, Error> {
         async move {
             let ipns = self.ipns();
             let mut resolved = ipns.resolve(path).await;
@@ -1301,24 +1365,26 @@ impl Ipfs {
                     resolved = ipns.resolve(res).await;
                 }
             }
-            resolved
+            Ok(resolved?)
         }
         .instrument(self.span.clone())
         .await
     }
 
     /// Publish ipns record to DHT
-    pub async fn publish_ipns(&self, path: &IpfsPath) -> Result<IpfsPath, Error> {
+    pub async fn publish_ipns(&self, path: impl Borrow<IpfsPath>) -> Result<IpfsPath, Error> {
         async move {
             let ipns = self.ipns();
-            ipns.publish(None, path, None).await
+            ipns.publish(None, path, Default::default())
+                .await
+                .map_err(anyhow::Error::from)
         }
         .instrument(self.span.clone())
         .await
     }
 
     /// Connects to the peer
-    pub async fn connect(&self, target: impl Into<DialOpts>) -> Result<(), Error> {
+    pub async fn connect(&self, target: impl Into<DialOpts>) -> Result<ConnectionId, Error> {
         async move {
             let target = target.into();
             let (tx, rx) = oneshot_channel();
@@ -1501,13 +1567,12 @@ impl Ipfs {
         .await
     }
 
-    /// Stream that returns [`PubsubEvent`] for a given topic
+    /// Stream that returns [`PubsubEvent`] for a given topic. if a topic is not supplied, it will provide all events emitted for any topic.
     pub async fn pubsub_events(
         &self,
-        topic: impl Into<String>,
+        topic: impl Into<Option<String>>,
     ) -> Result<BoxStream<'static, PubsubEvent>, Error> {
         async move {
-            let topic = topic.into();
             let (tx, rx) = oneshot_channel();
 
             self.to_task
@@ -1515,19 +1580,37 @@ impl Ipfs {
                 .send(IpfsEvent::PubsubEventStream(tx))
                 .await?;
 
-            let mut receiver = rx
-                .await?;
+            let receiver = rx.await?;
 
-            let defined_topic = topic.to_string();
+            let defined_topic = topic.into();
 
-            let stream = async_stream::stream! {
-                while let Some(event) = receiver.next().await {
-                    match &event {
-                        InnerPubsubEvent::Subscribe { topic, .. } | InnerPubsubEvent::Unsubscribe { topic, .. } if topic.eq(&defined_topic) => yield event.into(),
-                        _ => {}
-                    }
+            let stream = receiver.filter_map(move |event| {
+                let defined_topic = defined_topic.clone();
+                async move {
+                    let ev = match event {
+                        InnerPubsubEvent::Subscribe { topic, peer_id } => {
+                            let topic = match defined_topic {
+                                Some(defined_topic) if defined_topic.eq(&topic) => None,
+                                Some(defined_topic) if defined_topic.ne(&topic) => return None,
+                                Some(_) => return None,
+                                None => Some(topic),
+                            };
+                            PubsubEvent::Subscribe { peer_id, topic }
+                        }
+                        InnerPubsubEvent::Unsubscribe { topic, peer_id } => {
+                            let topic = match defined_topic {
+                                Some(defined_topic) if defined_topic.eq(&topic) => None,
+                                Some(defined_topic) if defined_topic.ne(&topic) => return None,
+                                Some(_) => return None,
+                                None => Some(topic),
+                            };
+                            PubsubEvent::Unsubscribe { peer_id, topic }
+                        }
+                    };
+
+                    Some(ev)
                 }
-            };
+            });
 
             Ok(stream.boxed())
         }
@@ -1611,6 +1694,126 @@ impl Ipfs {
         .await
     }
 
+    /// Subscribe to a stream of request. If a protocol is not supplied,
+    /// it will subscribe to the first or default protocol that was set in
+    /// [UninitializedIpfs::with_request_response]
+    pub async fn requests_subscribe(
+        &self,
+        protocol: impl Into<OptionalStreamProtocol>,
+    ) -> Result<BoxStream<'static, (PeerId, InboundRequestId, Bytes)>, Error> {
+        let protocol = protocol.into().into_inner();
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::RequestStream(protocol, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// Sends a request to a specific peer.
+    /// If a protocol is not supplied, it will use the first/default protocol that was set in
+    /// [UninitializedIpfs::with_request_response].
+    pub async fn send_request(
+        &self,
+        peer_id: PeerId,
+        request: impl IntoRequest,
+    ) -> Result<Bytes, Error> {
+        let (protocol, request) = request.into_request();
+        async move {
+            if request.is_empty() {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::Other, "request is empty").into(),
+                );
+            }
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::SendRequest(protocol, peer_id, request, tx))
+                .await?;
+
+            let fut = rx.await??;
+            fut.await.map_err(anyhow::Error::from)
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// Sends a request to a list of peers.
+    /// If a protocol is not supplied, it will use the first/default protocol that was set in
+    /// [UninitializedIpfs::with_request_response]
+    pub async fn send_requests(
+        &self,
+        peers: impl IntoIterator<Item = PeerId>,
+        request: impl IntoRequest,
+    ) -> Result<BoxStream<'static, (PeerId, std::io::Result<Bytes>)>, Error> {
+        let peers = IndexSet::from_iter(peers);
+        let (protocol, request) = request.into_request();
+
+        async move {
+            if peers.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "no peers were provided",
+                )
+                .into());
+            }
+            if request.is_empty() {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::Other, "request is empty").into(),
+                );
+            }
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::SendRequests(protocol, peers, request, tx))
+                .await?;
+
+            rx.await?.map_err(anyhow::Error::from)
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// Sends a request to a specific peer.
+    /// If a protocol is not supplied, it will use the first/default protocol that was set in
+    /// [UninitializedIpfs::with_request_response].
+    pub async fn send_response(
+        &self,
+        peer_id: PeerId,
+        id: InboundRequestId,
+        response: impl IntoRequest,
+    ) -> Result<(), Error> {
+        let (protocol, response) = response.into_request();
+        async move {
+            if response.is_empty() {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::Other, "response is empty").into(),
+                );
+            }
+
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::SendResponse(protocol, peer_id, id, response, tx))
+                .await?;
+
+            rx.await?.map_err(anyhow::Error::from)
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
     /// Returns the known wantlist for the local node when the `peer` is `None` or the wantlist of the given `peer`
     pub async fn bitswap_wantlist(
         &self,
@@ -1650,9 +1853,9 @@ impl Ipfs {
     #[cfg(feature = "experimental_stream")]
     pub async fn new_stream(
         &self,
-        protocol: impl Into<StreamProtocolRef>,
+        protocol: impl IntoStreamProtocol,
     ) -> Result<libp2p_stream::IncomingStreams, Error> {
-        let protocol: StreamProtocol = protocol.into().try_into()?;
+        let protocol: StreamProtocol = protocol.into_protocol()?;
         async move {
             let (tx, rx) = oneshot_channel();
 
@@ -1671,9 +1874,9 @@ impl Ipfs {
     pub async fn open_stream(
         &self,
         peer_id: PeerId,
-        protocol: impl Into<StreamProtocolRef>,
+        protocol: impl IntoStreamProtocol,
     ) -> Result<libp2p::Stream, Error> {
-        let protocol: StreamProtocol = protocol.into().try_into()?;
+        let protocol: StreamProtocol = protocol.into_protocol()?;
         async move {
             let mut control = self.stream_control().await?;
             let stream = control
@@ -1760,6 +1963,74 @@ impl Ipfs {
         .await
     }
 
+    /// Add a given multiaddr as a external address to indenticate how our node can be reached.
+    /// Note: We will not perform checks
+    pub async fn add_external_address(&self, addr: Multiaddr) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::AddExternalAddress(addr, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    /// Removes a previously added external address.
+    pub async fn remove_external_address(&self, addr: Multiaddr) -> Result<(), Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::RemoveExternalAddress(addr, tx))
+                .await?;
+
+            rx.await?
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    pub async fn connection_events(&self) -> Result<BoxStream<'static, ConnectionEvents>, Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::ConnectionEvents(tx))
+                .await?;
+
+            let rx = rx.await??;
+            Ok(rx.boxed())
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    pub async fn peer_connection_events(
+        &self,
+        peer_id: PeerId,
+    ) -> Result<BoxStream<'static, PeerConnectionEvents>, Error> {
+        async move {
+            let (tx, rx) = oneshot_channel();
+
+            self.to_task
+                .clone()
+                .send(IpfsEvent::PeerConnectionEvents(peer_id, tx))
+                .await?;
+
+            let rx = rx.await??;
+            Ok(rx.boxed())
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
     /// Obtain the addresses associated with the given `PeerId`; they are first searched for locally
     /// and the DHT is used as a fallback: a `Kademlia::get_closest_peers(peer_id)` query is run and
     /// when it's finished, the newly added DHT records are checked for the existence of the desired
@@ -1801,12 +2072,21 @@ impl Ipfs {
     ///
     /// Returns a list of peers found providing the Cid.
     pub async fn get_providers(&self, cid: Cid) -> Result<BoxStream<'static, PeerId>, Error> {
+        let key = cid.hash().to_bytes();
+        self.dht_get_providers(key).await
+    }
+
+    /// Performs a DHT lookup for providers of a value to the given key.
+    pub async fn dht_get_providers(
+        &self,
+        key: impl Into<Key>,
+    ) -> Result<BoxStream<'static, PeerId>, Error> {
+        let key = key.into();
         async move {
             let (tx, rx) = oneshot_channel();
-
             self.to_task
                 .clone()
-                .send(IpfsEvent::GetProviders(cid, tx))
+                .send(IpfsEvent::GetProviders(key, tx))
                 .await?;
 
             rx.await??.ok_or_else(|| anyhow!("Provider already exist"))
@@ -1828,12 +2108,21 @@ impl Ipfs {
             ));
         }
 
+        self.dht_provide(cid.hash().to_bytes()).await
+    }
+
+    /// Establishes the node as a provider of a given Key: it publishes a provider
+    /// record with the given key and the node's PeerId to the peers closest to the key. The
+    /// publication of provider records is periodically repeated as per the interval specified in
+    /// `libp2p`'s  `KademliaConfig`.
+    pub async fn dht_provide(&self, key: impl Into<Key>) -> Result<(), Error> {
+        let key = key.into();
         let kad_result = async move {
             let (tx, rx) = oneshot_channel();
 
             self.to_task
                 .clone()
-                .send(IpfsEvent::Provide(cid, tx))
+                .send(IpfsEvent::Provide(key, tx))
                 .await?;
 
             rx.await?
@@ -2152,7 +2441,7 @@ impl Ipfs {
         iplds: Iter,
         max_depth: Option<u64>,
         unique: bool,
-    ) -> impl Stream<Item = Result<refs::Edge, libipld::error::Error>> + Send + 'a
+    ) -> impl Stream<Item = Result<refs::Edge, anyhow::Error>> + Send + 'a
     where
         Iter: IntoIterator<Item = (Cid, Ipld)> + Send + 'a,
     {
@@ -2249,29 +2538,33 @@ impl Ipfs {
     /// known in order for the process to succeed. Subsequently, additional queries are
     /// ran with random keys so that the buckets farther from the closest neighbor also
     /// get refreshed.
-    pub async fn bootstrap(&self) -> Result<JoinHandle<Result<KadResult, Error>>, Error> {
+    pub async fn bootstrap(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot_channel();
 
         self.to_task.clone().send(IpfsEvent::Bootstrap(tx)).await?;
         let fut = rx.await??;
 
-        let bootstrap_task =
-            tokio::spawn(async move { fut.await.map_err(|e| anyhow!(e)).and_then(|res| res) });
+        async_rt::task::dispatch(async move {
+            if let Err(e) = fut.await.map_err(|e| anyhow!(e)) {
+                tracing::error!(error = %e, "failed to bootstrap");
+            }
+        });
 
-        Ok(bootstrap_task)
+        Ok(())
     }
 
     /// Add address of a peer to the address book
-    pub async fn add_peer(&self, peer_id: PeerId, mut addr: Multiaddr) -> Result<(), Error> {
-        if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
-            addr.pop();
+    pub async fn add_peer(&self, opt: impl IntoAddPeerOpt) -> Result<(), Error> {
+        let opt: AddPeerOpt = opt.into_opt()?;
+        if opt.addresses().is_empty() {
+            anyhow::bail!("no address supplied");
         }
 
         let (tx, rx) = oneshot::channel();
 
         self.to_task
             .clone()
-            .send(IpfsEvent::AddPeer(peer_id, addr, tx))
+            .send(IpfsEvent::AddPeer(opt, tx))
             .await?;
 
         rx.await??;
@@ -2337,44 +2630,390 @@ impl Ipfs {
 
         // ignoring the error because it'd mean that the background task had already been dropped
         let _ = self.to_task.try_send(IpfsEvent::Exit);
+
+        // terminte task that handles GC and spawn task
+        self._gc_guard.abort();
+        self._guard.abort();
     }
 }
 
-pub enum StreamProtocolRef {
-    Static(&'static str),
-    Owned(String),
-    Direct(StreamProtocol),
+pub trait IntoStreamProtocol {
+    fn into_protocol(self) -> std::io::Result<StreamProtocol>;
 }
 
-impl From<&'static str> for StreamProtocolRef {
-    fn from(protocol: &'static str) -> Self {
-        StreamProtocolRef::Static(protocol)
+impl IntoStreamProtocol for StreamProtocol {
+    fn into_protocol(self) -> std::io::Result<StreamProtocol> {
+        Ok(self)
     }
 }
 
-impl From<String> for StreamProtocolRef {
-    fn from(protocol: String) -> Self {
-        StreamProtocolRef::Owned(protocol)
+impl IntoStreamProtocol for String {
+    fn into_protocol(self) -> std::io::Result<StreamProtocol> {
+        StreamProtocol::try_from_owned(self).map_err(std::io::Error::other)
     }
 }
 
-impl From<StreamProtocol> for StreamProtocolRef {
+impl IntoStreamProtocol for &'static str {
+    fn into_protocol(self) -> std::io::Result<StreamProtocol> {
+        Ok(StreamProtocol::new(self))
+    }
+}
+
+pub struct OptionalStreamProtocol(pub(crate) Option<StreamProtocol>);
+
+impl OptionalStreamProtocol {
+    pub(crate) fn into_inner(self) -> Option<StreamProtocol> {
+        self.0
+    }
+}
+
+impl From<()> for OptionalStreamProtocol {
+    fn from(_: ()) -> Self {
+        Self(None)
+    }
+}
+
+impl From<StreamProtocol> for OptionalStreamProtocol {
     fn from(protocol: StreamProtocol) -> Self {
-        StreamProtocolRef::Direct(protocol)
+        Self(Some(protocol))
     }
 }
 
-impl TryFrom<StreamProtocolRef> for StreamProtocol {
-    type Error = std::io::Error;
-    fn try_from(protocl_ref: StreamProtocolRef) -> Result<Self, Self::Error> {
-        let protocol = match protocl_ref {
-            StreamProtocolRef::Direct(protocol) => protocol,
-            StreamProtocolRef::Owned(protocol) => StreamProtocol::try_from_owned(protocol)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-            StreamProtocolRef::Static(protocol) => StreamProtocol::new(protocol),
-        };
+impl From<String> for OptionalStreamProtocol {
+    fn from(protocol: String) -> Self {
+        let protocol = StreamProtocol::try_from_owned(protocol).ok();
+        Self(protocol)
+    }
+}
 
-        Ok(protocol)
+impl From<&'static str> for OptionalStreamProtocol {
+    fn from(protocol: &'static str) -> Self {
+        let protocol = StreamProtocol::new(protocol);
+        Self(Some(protocol))
+    }
+}
+
+// TODO: Move into a macro
+pub trait IntoRequest {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes);
+}
+
+impl IntoRequest for Bytes {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        (None, self)
+    }
+}
+
+impl<const N: usize> IntoRequest for [u8; N] {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(Bytes::copy_from_slice(&self))
+    }
+}
+
+impl<const N: usize> IntoRequest for &[u8; N] {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(Bytes::copy_from_slice(self))
+    }
+}
+
+impl IntoRequest for Vec<u8> {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(Bytes::from(self))
+    }
+}
+
+impl IntoRequest for &[u8] {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(Bytes::copy_from_slice(self))
+    }
+}
+
+impl IntoRequest for String {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(Bytes::from(self.into_bytes()))
+    }
+}
+
+impl IntoRequest for &'static str {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request(self.to_string())
+    }
+}
+
+impl IntoRequest for (StreamProtocol, Bytes) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        (Some(self.0), self.1)
+    }
+}
+
+impl<const N: usize> IntoRequest for (StreamProtocol, [u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(&self.1)))
+    }
+}
+
+impl<const N: usize> IntoRequest for (StreamProtocol, &[u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (StreamProtocol, Vec<u8>) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1)))
+    }
+}
+
+impl IntoRequest for (StreamProtocol, &[u8]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (StreamProtocol, String) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1.into_bytes())))
+    }
+}
+
+impl IntoRequest for (StreamProtocol, &'static str) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, self.1.to_string()))
+    }
+}
+
+impl IntoRequest for (String, Bytes) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        (
+            Some(StreamProtocol::try_from_owned(self.0).expect("valid protocol")),
+            self.1,
+        )
+    }
+}
+
+impl<const N: usize> IntoRequest for (String, [u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(&self.1)))
+    }
+}
+
+impl<const N: usize> IntoRequest for (String, &[u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (String, Vec<u8>) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1)))
+    }
+}
+
+impl IntoRequest for (String, &[u8]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (String, String) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1.into_bytes())))
+    }
+}
+
+impl IntoRequest for (String, &'static str) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, self.1.to_string()))
+    }
+}
+
+impl IntoRequest for (&'static str, Bytes) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        (Some(StreamProtocol::new(self.0)), self.1)
+    }
+}
+
+impl<const N: usize> IntoRequest for (&'static str, [u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(&self.1)))
+    }
+}
+
+impl<const N: usize> IntoRequest for (&'static str, &[u8; N]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (&'static str, Vec<u8>) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1)))
+    }
+}
+
+impl IntoRequest for (&'static str, &[u8]) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::copy_from_slice(self.1)))
+    }
+}
+
+impl IntoRequest for (&'static str, String) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, Bytes::from(self.1.into_bytes())))
+    }
+}
+
+impl IntoRequest for (&'static str, &'static str) {
+    fn into_request(self) -> (Option<StreamProtocol>, Bytes) {
+        IntoRequest::into_request((self.0, self.1.to_string()))
+    }
+}
+
+#[derive(Debug)]
+pub struct AddPeerOpt {
+    peer_id: PeerId,
+    addresses: Vec<Multiaddr>,
+    condition: Option<PeerCondition>,
+    dial: bool,
+    keepalive: bool,
+    reconnect: Option<(Duration, u8)>,
+}
+
+impl AddPeerOpt {
+    pub fn with_peer_id(peer_id: PeerId) -> Self {
+        Self {
+            peer_id,
+            addresses: vec![],
+            condition: None,
+            dial: false,
+            keepalive: false,
+            reconnect: None,
+        }
+    }
+
+    pub fn add_address(mut self, mut addr: Multiaddr) -> Self {
+        if addr.is_empty() {
+            return self;
+        }
+
+        match addr.iter().last() {
+            // if the address contains a peerid, we should confirm it matches the initial peer
+            Some(Protocol::P2p(peer_id)) if peer_id == self.peer_id => {
+                addr.pop();
+            }
+            Some(Protocol::P2p(_)) => return self,
+            _ => {}
+        }
+
+        if !self.addresses.contains(&addr) {
+            self.addresses.push(addr);
+        }
+
+        self
+    }
+
+    pub fn set_addresses(mut self, addrs: Vec<Multiaddr>) -> Self {
+        for addr in addrs {
+            self = self.add_address(addr);
+        }
+
+        self
+    }
+
+    pub fn set_peer_condition(mut self, condition: PeerCondition) -> Self {
+        self.condition = Some(condition);
+        self
+    }
+
+    pub fn set_dial(mut self, dial: bool) -> Self {
+        self.dial = dial;
+        self
+    }
+
+    pub fn set_reconnect(mut self, reconnect: impl Into<Option<(Duration, u8)>>) -> Self {
+        self.reconnect = reconnect.into();
+        self
+    }
+
+    pub fn reconnect(mut self, duration: Duration, interval: u8) -> Self {
+        self.reconnect = Some((duration, interval));
+        self
+    }
+
+    pub fn keepalive(mut self) -> Self {
+        self.keepalive = true;
+        self
+    }
+
+    pub fn set_keepalive(mut self, keepalive: bool) -> Self {
+        self.keepalive = keepalive;
+        self
+    }
+}
+
+impl AddPeerOpt {
+    pub fn peer_id(&self) -> &PeerId {
+        &self.peer_id
+    }
+
+    pub fn addresses(&self) -> &[Multiaddr] {
+        &self.addresses
+    }
+
+    pub fn can_keep_alive(&self) -> bool {
+        self.keepalive
+    }
+
+    pub fn reconnect_opt(&self) -> Option<(Duration, u8)> {
+        self.reconnect
+    }
+
+    pub fn to_dial_opts(&self) -> Option<DialOpts> {
+        if !self.dial {
+            return None;
+        }
+
+        // We dial without addresses attached because it will they will be fetched within the address book
+        // which will allow us not only to use those addresses but any addresses from other behaviours
+        let opts = DialOpts::peer_id(self.peer_id)
+            .condition(self.condition.unwrap_or_default())
+            .build();
+
+        Some(opts)
+    }
+}
+
+pub trait IntoAddPeerOpt {
+    fn into_opt(self) -> Result<AddPeerOpt, anyhow::Error>;
+}
+
+impl IntoAddPeerOpt for AddPeerOpt {
+    fn into_opt(self) -> Result<AddPeerOpt, anyhow::Error> {
+        Ok(self)
+    }
+}
+
+impl IntoAddPeerOpt for (PeerId, Multiaddr) {
+    fn into_opt(self) -> Result<AddPeerOpt, anyhow::Error> {
+        let (peer_id, addr) = self;
+        Ok(AddPeerOpt::with_peer_id(peer_id).add_address(addr))
+    }
+}
+
+impl IntoAddPeerOpt for (PeerId, Vec<Multiaddr>) {
+    fn into_opt(self) -> Result<AddPeerOpt, anyhow::Error> {
+        let (peer_id, addrs) = self;
+        Ok(AddPeerOpt::with_peer_id(peer_id).set_addresses(addrs))
+    }
+}
+
+impl IntoAddPeerOpt for Multiaddr {
+    fn into_opt(mut self) -> Result<AddPeerOpt, anyhow::Error> {
+        let peer_id = self
+            .extract_peer_id()
+            .ok_or(anyhow::anyhow!("address does not contain peer id"))
+            .map_err(std::io::Error::other)?;
+        Ok(AddPeerOpt::with_peer_id(peer_id).add_address(self))
     }
 }
 
@@ -2401,8 +3040,6 @@ pub(crate) fn split_dht_key(key: &str) -> anyhow::Result<(&str, &str)> {
 
 #[inline]
 pub(crate) fn ipns_to_dht_key<B: AsRef<str>>(key: B) -> anyhow::Result<Key> {
-    use libipld::multibase;
-
     let default_ipns_prefix = b"/ipns/";
 
     let mut key = key.as_ref().trim().to_string();
@@ -2444,13 +3081,12 @@ pub(crate) fn to_dht_key<B: AsRef<str>, F: Fn(&str) -> anyhow::Result<Key>>(
 }
 
 use crate::p2p::AddressBookConfig;
+use crate::repo::{RepoGetBlock, RepoPutBlock};
 #[doc(hidden)]
 pub use node::Node;
 
 /// Node module provides an easy to use interface used in `tests/`.
 mod node {
-    use futures::TryFutureExt;
-
     use super::*;
 
     /// Node encapsulates everything to setup a testing instance so that multi-node tests become
@@ -2465,6 +3101,12 @@ mod node {
         pub addrs: Vec<Multiaddr>,
     }
 
+    impl IntoAddPeerOpt for &Node {
+        fn into_opt(self) -> Result<AddPeerOpt, anyhow::Error> {
+            Ok(AddPeerOpt::with_peer_id(self.id).set_addresses(self.addrs.clone()))
+        }
+    }
+
     impl Node {
         /// Initialises a new `Node` with an in-memory store backed configuration.
         ///
@@ -2475,21 +3117,27 @@ mod node {
         }
 
         /// Connects to a peer at the given address.
-        pub async fn connect<D: Into<DialOpts>>(&self, opt: D) -> Result<(), Error> {
+        pub async fn connect(&self, opt: impl Into<DialOpts>) -> Result<(), Error> {
             let opts = opt.into();
             if let Some(peer_id) = opts.get_peer_id() {
                 if self.ipfs.is_connected(peer_id).await? {
                     return Ok(());
                 }
             }
-            self.ipfs.connect(opts).await
+            self.ipfs.connect(opts).await.map(|_| ())
         }
 
         /// Returns a new `Node` based on `IpfsOptions`.
         pub async fn with_options(span: Option<Span>, addr: Option<Vec<Multiaddr>>) -> Self {
             // for future: assume UninitializedIpfs handles instrumenting any futures with the
             // given span
-            let mut uninit = UninitializedIpfsNoop::new().with_default();
+            let mut uninit = UninitializedIpfsDefault::new()
+                .with_default()
+                .with_request_response(Default::default())
+                .set_transport_configuration(TransportConfig {
+                    enable_memory_transport: true,
+                    ..Default::default()
+                });
 
             if let Some(span) = span {
                 uninit = uninit.set_span(span);
@@ -2497,7 +3145,7 @@ mod node {
 
             let list = match addr {
                 Some(addr) => addr,
-                None => vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                None => vec![Multiaddr::empty().with(Protocol::Memory(0))],
             };
 
             let ipfs = uninit.start().await.unwrap();
@@ -2536,16 +3184,13 @@ mod node {
         /// known in order for the process to succeed. Subsequently, additional queries are
         /// ran with random keys so that the buckets farther from the closest neighbor also
         /// get refreshed.
-        pub async fn bootstrap(&self) -> Result<KadResult, Error> {
-            self.ipfs
-                .bootstrap()
-                .and_then(|fut| async { fut.await.map_err(anyhow::Error::from) })
-                .await?
+        pub async fn bootstrap(&self) -> Result<(), Error> {
+            self.ipfs.bootstrap().await
         }
 
         pub async fn add_node(&self, node: &Self) -> Result<(), Error> {
             for addr in &node.addrs {
-                self.add_peer(node.id, addr.to_owned()).await?;
+                self.add_peer((node.id, addr.to_owned())).await?;
             }
 
             Ok(())
@@ -2575,22 +3220,22 @@ mod node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libipld::{
-        ipld,
-        multihash::{Code, MultihashDigest},
-        IpldCodec,
-    };
+
+    use crate::block::BlockCodec;
+    use ipld_core::ipld;
+    use multihash_codetable::Code;
+    use multihash_derive::MultihashDigest;
 
     #[tokio::test]
     async fn test_put_and_get_block() {
         let ipfs = Node::new("test_node").await;
 
         let data = b"hello block\n".to_vec();
-        let cid = Cid::new_v1(IpldCodec::Raw.into(), Code::Sha2_256.digest(&data));
+        let cid = Cid::new_v1(BlockCodec::Raw.into(), Code::Sha2_256.digest(&data));
         let block = Block::new(cid, data).unwrap();
 
-        let cid: Cid = ipfs.put_block(block.clone()).await.unwrap();
-        let new_block = ipfs.get_block(&cid).await.unwrap();
+        let cid: Cid = ipfs.put_block(&block).await.unwrap();
+        let new_block = ipfs.get_block(cid).await.unwrap();
         assert_eq!(block, new_block);
     }
 
@@ -2611,8 +3256,8 @@ mod tests {
         let data = ipld!([-1, -2, -3]);
         let cid = ipfs.put_dag(data.clone()).pin(false).await.unwrap();
 
-        assert!(ipfs.is_pinned(&cid).await.unwrap());
-        ipfs.remove_pin(&cid).await.unwrap();
-        assert!(!ipfs.is_pinned(&cid).await.unwrap());
+        assert!(ipfs.is_pinned(cid).await.unwrap());
+        ipfs.remove_pin(cid).await.unwrap();
+        assert!(!ipfs.is_pinned(cid).await.unwrap());
     }
 }

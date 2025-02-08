@@ -10,7 +10,6 @@ use libp2p::{
         SupportedProtocols,
     },
 };
-use void::Void;
 
 #[allow(clippy::type_complexity)]
 #[allow(deprecated)]
@@ -37,12 +36,12 @@ pub enum Out {
 
 #[allow(deprecated)]
 impl ConnectionHandler for Handler {
-    type FromBehaviour = Void;
+    type FromBehaviour = ();
     type ToBehaviour = Out;
     type InboundProtocol = DeniedUpgrade;
     type OutboundProtocol = DeniedUpgrade;
     type InboundOpenInfo = ();
-    type OutboundOpenInfo = Void;
+    type OutboundOpenInfo = ();
 
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(DeniedUpgrade, ())
@@ -53,7 +52,7 @@ impl ConnectionHandler for Handler {
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
-        void::unreachable(event)
+        let _ = event;
     }
 
     #[allow(clippy::wildcard_in_or_patterns)]
@@ -66,40 +65,29 @@ impl ConnectionHandler for Handler {
             Self::OutboundOpenInfo,
         >,
     ) {
-        match event {
-            ConnectionEvent::RemoteProtocolsChange(protocol) => {
-                let change = self.supported_protocol.on_protocols_change(protocol);
-                if change {
-                    let valid = self
-                        .supported_protocol
-                        .iter()
-                        .any(|proto| libp2p::relay::HOP_PROTOCOL_NAME.eq(proto));
+        if let ConnectionEvent::RemoteProtocolsChange(protocol) = event {
+            let change = self.supported_protocol.on_protocols_change(protocol);
+            if change {
+                let valid = self
+                    .supported_protocol
+                    .iter()
+                    .any(|proto| libp2p::relay::HOP_PROTOCOL_NAME.eq(proto));
 
-                    match (valid, self.supported) {
-                        (true, false) => {
-                            self.supported = true;
-                            self.events
-                                .push_back(ConnectionHandlerEvent::NotifyBehaviour(Out::Supported));
-                        }
-                        (false, true) => {
-                            self.supported = false;
-                            self.events
-                                .push_back(ConnectionHandlerEvent::NotifyBehaviour(
-                                    Out::Unsupported,
-                                ));
-                        }
-                        (true, true) => {}
-                        _ => {}
+                match (valid, self.supported) {
+                    (true, false) => {
+                        self.supported = true;
+                        self.events
+                            .push_back(ConnectionHandlerEvent::NotifyBehaviour(Out::Supported));
                     }
+                    (false, true) => {
+                        self.supported = false;
+                        self.events
+                            .push_back(ConnectionHandlerEvent::NotifyBehaviour(Out::Unsupported));
+                    }
+                    (true, true) => {}
+                    _ => {}
                 }
             }
-            ConnectionEvent::FullyNegotiatedInbound(_)
-            | ConnectionEvent::FullyNegotiatedOutbound(_)
-            | ConnectionEvent::AddressChange(_)
-            | ConnectionEvent::DialUpgradeError(_)
-            | ConnectionEvent::ListenUpgradeError(_)
-            | ConnectionEvent::LocalProtocolsChange(_)
-            | _ => {}
         }
     }
 

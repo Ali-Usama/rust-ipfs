@@ -1,8 +1,9 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    use ipld_core::ipld;
     use rust_ipfs::Ipfs;
     use rust_ipfs::IpfsPath;
-    use rust_ipfs::UninitializedIpfsNoop as UninitializedIpfs;
+    use rust_ipfs::UninitializedIpfsDefault as UninitializedIpfs;
     tracing_subscriber::fmt::init();
 
     // Initialize the repo and start a daemon
@@ -19,12 +20,12 @@ async fn main() -> anyhow::Result<()> {
 
     ipfs.bootstrap().await?;
 
-    let block_a = libipld::ipld!({
+    let block_a = ipld!({
         "name": "alice",
         "age": 99,
     });
 
-    let cid = ipfs.put_dag(block_a.clone()).await?;
+    let cid = ipfs.put_dag(block_a).await?;
 
     let ipfs_path = IpfsPath::from(cid);
 

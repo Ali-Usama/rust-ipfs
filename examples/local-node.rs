@@ -19,7 +19,6 @@ async fn main() -> anyhow::Result<()> {
         .with_relay(true)
         .with_relay_server(Default::default())
         .with_upnp()
-        .with_rendezvous_server()
         .with_custom_behaviour(ext_behaviour::Behaviour::new(local_peer_id))
         .listen_as_external_addr()
         .fd_limit(rust_ipfs::FDLimit::Max)
@@ -37,11 +36,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 mod ext_behaviour {
-    use std::{
-        collections::HashSet,
-        task::{Context, Poll},
-    };
-
+    use libp2p::swarm::derive_prelude::PortUse;
     use libp2p::{
         core::Endpoint,
         swarm::{
@@ -51,6 +46,11 @@ mod ext_behaviour {
         Multiaddr, PeerId,
     };
     use rust_ipfs::NetworkBehaviour;
+    use std::convert::Infallible;
+    use std::{
+        collections::HashSet,
+        task::{Context, Poll},
+    };
 
     #[derive(Default, Debug)]
     pub struct Behaviour {
@@ -68,7 +68,7 @@ mod ext_behaviour {
 
     impl NetworkBehaviour for Behaviour {
         type ConnectionHandler = rust_ipfs::libp2p::swarm::dummy::ConnectionHandler;
-        type ToSwarm = void::Void;
+        type ToSwarm = Infallible;
 
         fn handle_pending_inbound_connection(
             &mut self,
@@ -105,6 +105,7 @@ mod ext_behaviour {
             _: PeerId,
             _: &Multiaddr,
             _: Endpoint,
+            _: PortUse,
         ) -> Result<THandler<Self>, ConnectionDenied> {
             Ok(rust_ipfs::libp2p::swarm::dummy::ConnectionHandler)
         }

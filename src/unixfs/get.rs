@@ -5,17 +5,21 @@ use std::{
 };
 
 use either::Either;
+use futures::stream::BoxStream;
 use futures::{future::BoxFuture, stream::FusedStream, FutureExt, Stream, StreamExt};
 use libp2p::PeerId;
+#[allow(unused_imports)]
 use rust_unixfs::walk::{ContinuedWalk, Walker};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::AsyncWriteExt;
 use tracing::{Instrument, Span};
 
 use crate::{dag::IpldDag, repo::Repo, Ipfs, IpfsPath};
 
-use super::{StatusStreamState, TraversalFailed, UnixfsStatus};
+#[allow(unused_imports)]
+use super::{TraversalFailed, UnixfsStatus};
 
-#[must_use = "do nothing unless you `.await` or poll the stream"]
+#[must_use = "does nothing unless you `.await` or poll the stream"]
 pub struct UnixfsGet {
     core: Option<Either<Ipfs, Repo>>,
     dest: PathBuf,
@@ -24,7 +28,7 @@ pub struct UnixfsGet {
     providers: Vec<PeerId>,
     local_only: bool,
     timeout: Option<Duration>,
-    stream: StatusStreamState,
+    stream: Option<BoxStream<'static, UnixfsStatus>>,
 }
 
 impl UnixfsGet {
@@ -51,7 +55,7 @@ impl UnixfsGet {
             providers: Vec::new(),
             local_only: false,
             timeout: None,
-            stream: StatusStreamState::None,
+            stream: None,
         }
     }
 
@@ -68,7 +72,7 @@ impl UnixfsGet {
     }
 
     pub fn providers(mut self, list: &[PeerId]) -> Self {
-        self.providers = list.to_owned();
+        self.providers = list.to_vec();
         self
     }
 
@@ -94,24 +98,15 @@ impl Stream for UnixfsGet {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        if self.core.is_none() && self.stream.is_none() {
+            return Poll::Ready(None);
+        }
         loop {
             match &mut self.stream {
-                StatusStreamState::None => {
-                    let (repo, dag, session) = match self.core.take().expect("ipfs or repo is used")
-                    {
-                        Either::Left(ipfs) => (
-                            ipfs.repo().clone(),
-                            ipfs.dag(),
-                            Some(
-                                crate::BITSWAP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-                            ),
-                        ),
-                        Either::Right(repo) => {
-                            let session = repo.is_online().then(|| {
-                                crate::BITSWAP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            });
-                            (repo.clone(), IpldDag::from(repo.clone()), session)
-                        }
+                None => {
+                    let (repo, dag) = match self.core.take().expect("ipfs or repo is used") {
+                        Either::Left(ipfs) => (ipfs.repo().clone(), ipfs.dag()),
+                        Either::Right(repo) => (repo.clone(), IpldDag::from(repo.clone())),
                     };
 
                     let path = self.path.take().expect("starting point exist");
@@ -120,8 +115,8 @@ impl Stream for UnixfsGet {
                     let timeout = self.timeout;
                     let dest = self.dest.clone();
 
+                    #[cfg(not(target_arch = "wasm32"))]
                     let stream = async_stream::stream! {
-
 
                         let mut cache = None;
                         let mut total_size = None;
@@ -132,19 +127,19 @@ impl Stream for UnixfsGet {
                             .map_err(TraversalFailed::Io) {
                                 Ok(f) => f,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                     return;
                                 }
                             };
 
                         let block  = match dag
-                            .resolve_with_session(session, path.clone(), true, &providers, local_only, timeout)
+                            ._resolve(path.clone(), true, &providers, local_only, timeout)
                             .await
                             .map_err(TraversalFailed::Resolving)
                             .and_then(|(resolved, _)| resolved.into_unixfs_block().map_err(TraversalFailed::Path)) {
                                 Ok(block) => block,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                     return;
                                 }
                         };
@@ -156,10 +151,10 @@ impl Stream for UnixfsGet {
 
                         while walker.should_continue() {
                             let (next, _) = walker.pending_links();
-                            let block = match repo.get_block_with_session(session, next, &providers, local_only, timeout).await {
+                            let block = match repo.get_block(next).providers(&providers).set_local(local_only).timeout(timeout).await {
                                 Ok(block) => block,
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(e) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e };
                                     return;
                                 }
                             };
@@ -185,26 +180,24 @@ impl Stream for UnixfsGet {
                                         let next = &slice[n..];
                                         n += next.len();
                                         if let Err(e) = file.write_all(next).await {
-                                            yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                            yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                             return;
                                         }
                                         if let Err(e) = file.sync_all().await {
-                                            yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                            yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                             return;
                                         }
 
                                         written += n;
-                                        yield UnixfsStatus::ProgressStatus { written, total_size };
                                     }
 
-                                    if segment.is_last() {
-                                        yield UnixfsStatus::ProgressStatus { written, total_size };
-                                    }
+                                    yield UnixfsStatus::ProgressStatus { written, total_size };
+
                                 },
                                 Ok(ContinuedWalk::Directory( .. )) | Ok(ContinuedWalk::RootDirectory( .. )) => {}, //TODO
                                 Ok(ContinuedWalk::Symlink( .. )) => {},
                                 Err(e) => {
-                                    yield UnixfsStatus::FailedStatus { written, total_size, error: Some(anyhow::Error::from(e)) };
+                                    yield UnixfsStatus::FailedStatus { written, total_size, error: e.into() };
                                     return;
                                 }
                             };
@@ -213,29 +206,36 @@ impl Stream for UnixfsGet {
                         yield UnixfsStatus::CompletedStatus { path, written, total_size }
                     };
 
-                    self.stream = StatusStreamState::Pending {
-                        stream: stream.boxed(),
+                    #[cfg(target_arch = "wasm32")]
+                    let stream = async_stream::stream! {
+                        _ = repo;
+                        _ = dag;
+                        _ = path;
+                        _ = providers;
+                        _ = local_only;
+                        _ = timeout;
+                        _ = dest;
+                        yield UnixfsStatus::FailedStatus { written: 0, total_size: None, error: anyhow::anyhow!("unimplemented") };
                     };
+
+                    self.stream = Some(stream.boxed());
                 }
-                StatusStreamState::Pending { stream } => {
-                    match futures::ready!(stream.poll_next_unpin(cx)) {
-                        Some(item) => {
-                            if matches!(
-                                item,
-                                UnixfsStatus::FailedStatus { .. }
-                                    | UnixfsStatus::CompletedStatus { .. }
-                            ) {
-                                self.stream = StatusStreamState::Done;
-                            }
-                            return Poll::Ready(Some(item));
+                Some(stream) => match futures::ready!(stream.poll_next_unpin(cx)) {
+                    Some(item) => {
+                        if matches!(
+                            item,
+                            UnixfsStatus::FailedStatus { .. }
+                                | UnixfsStatus::CompletedStatus { .. }
+                        ) {
+                            self.stream.take();
                         }
-                        None => {
-                            self.stream = StatusStreamState::Done;
-                            return Poll::Ready(None);
-                        }
+                        return Poll::Ready(Some(item));
                     }
-                }
-                StatusStreamState::Done => return Poll::Ready(None),
+                    None => {
+                        self.stream.take();
+                        return Poll::Ready(None);
+                    }
+                },
             }
         }
     }
@@ -252,8 +252,6 @@ impl std::future::IntoFuture for UnixfsGet {
             while let Some(status) = self.next().await {
                 match status {
                     UnixfsStatus::FailedStatus { error, .. } => {
-                        let error = error
-                            .unwrap_or(anyhow::anyhow!("Unknown error while writting to disk"));
                         return Err(error);
                     }
                     UnixfsStatus::CompletedStatus { .. } => return Ok(()),
@@ -269,6 +267,6 @@ impl std::future::IntoFuture for UnixfsGet {
 
 impl FusedStream for UnixfsGet {
     fn is_terminated(&self) -> bool {
-        matches!(self.stream, StatusStreamState::Done) && self.core.is_none()
+        self.stream.is_none() && self.core.is_none()
     }
 }

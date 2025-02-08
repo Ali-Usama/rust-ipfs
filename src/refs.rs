@@ -1,9 +1,10 @@
 //! `refs` or the references of dag-pb and other supported IPLD formats functionality.
 
+use crate::block::BlockCodec;
 use crate::repo::Repo;
 use async_stream::stream;
 use futures::stream::Stream;
-use libipld::{Cid, Ipld, IpldCodec};
+use ipld_core::{cid::Cid, ipld::Ipld};
 use libp2p::PeerId;
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -93,15 +94,9 @@ impl IpldRefs {
         self
     }
 
-    /// Peer that may contain the block
-    pub fn provider(mut self, peer_id: PeerId) -> Self {
-        self.providers.push(peer_id);
-        self
-    }
-
     /// List of peers that may contain the block
     pub fn providers(mut self, providers: &[PeerId]) -> Self {
-        self.providers = providers.to_vec();
+        self.providers = providers.into();
         self
     }
 
@@ -147,7 +142,7 @@ pub fn iplds_refs<'a, MaybeOwned, Iter>(
     iplds: Iter,
     max_depth: Option<u64>,
     unique: bool,
-) -> impl Stream<Item = Result<Edge, libipld::error::Error>> + Send + 'a
+) -> impl Stream<Item = Result<Edge, anyhow::Error>> + Send + 'a
 where
     MaybeOwned: Borrow<Repo> + Send + 'a,
     Iter: IntoIterator<Item = (Cid, Ipld)> + Send + 'a,
@@ -230,7 +225,7 @@ where
             let borrowed = repo.borrow();
 
             let block = if download_blocks {
-                match borrowed.get_block_with_session(None, &cid, &providers, !download_blocks, timeout).await {
+                match borrowed.get_block(cid).providers(&providers).set_local(!download_blocks).timeout(timeout).await {
                     Ok(block) => block,
                     Err(e) => {
                         warn!("failed to load {}, linked from {}: {}", cid, source, e);
@@ -263,13 +258,13 @@ where
 
             trace!(cid = %cid, "loaded next");
 
-            let ipld = match block.decode::<IpldCodec, Ipld>() {
+            let ipld = match block.to_ipld() {
                 Ok(ipld) => ipld,
                 Err(e) => {
                     warn!(cid = %cid, source = %cid, "failed to parse: {}", e);
                     // go-ipfs on raw Qm hash:
                     // > failed to decode Protocol Buffers: incorrectly formatted merkledag node: unmarshal failed. proto: illegal wireType 6
-                    yield Err(e.into());
+                    yield Err(anyhow::Error::from(e).into());
                     continue;
                 }
             };
@@ -296,7 +291,7 @@ fn ipld_links(
 ) -> impl Iterator<Item = (Option<String>, Cid)> + Send + 'static {
     // a wrapping iterator without there being a libipld_base::IpldIntoIter might not be doable
     // with safe code
-    let items = if cid.codec() == <IpldCodec as Into<u64>>::into(IpldCodec::DagPb) {
+    let items = if cid.codec() == <BlockCodec as Into<u64>>::into(BlockCodec::DagPb) {
         dagpb_links(ipld)
     } else {
         ipld.iter()
@@ -376,7 +371,7 @@ mod tests {
     use crate::{Block, Node};
     use futures::stream::TryStreamExt;
     use hex_literal::hex;
-    use libipld::{Cid, Ipld, IpldCodec};
+    use ipld_core::cid::Cid;
     use std::collections::HashSet;
     use std::convert::TryFrom;
 
@@ -396,7 +391,7 @@ mod tests {
 
         let decoded = Block::new(cid, payload.to_vec())
             .unwrap()
-            .decode::<IpldCodec, Ipld>()
+            .to_ipld()
             .unwrap();
 
         let links = ipld_links(&cid, decoded)
@@ -421,8 +416,8 @@ mod tests {
             "QmRgutAxd8t7oGkSm4wmeuByG6M51wcTso6cubDdQtuEfL",
         );
 
-        let root_block = ipfs.get_block(&Cid::try_from(root).unwrap()).await.unwrap();
-        let ipld = root_block.decode::<IpldCodec, Ipld>().unwrap();
+        let root_block = ipfs.get_block(Cid::try_from(root).unwrap()).await.unwrap();
+        let ipld = root_block.to_ipld().unwrap();
 
         let all_edges: Vec<_> =
             iplds_refs(ipfs.repo(), vec![(*root_block.cid(), ipld)], None, false)
@@ -469,8 +464,8 @@ mod tests {
             "QmRgutAxd8t7oGkSm4wmeuByG6M51wcTso6cubDdQtuEfL",
         );
 
-        let root_block = ipfs.get_block(&Cid::try_from(root).unwrap()).await.unwrap();
-        let ipld = root_block.decode::<IpldCodec, Ipld>().unwrap();
+        let root_block = ipfs.get_block(Cid::try_from(root).unwrap()).await.unwrap();
+        let ipld = root_block.to_ipld().unwrap();
 
         let destinations: HashSet<_> =
             iplds_refs(ipfs.repo(), vec![(*root_block.cid(), ipld)], None, true)
@@ -545,8 +540,8 @@ mod tests {
         for (cid_str, data) in blocks.iter() {
             let cid = Cid::try_from(*cid_str).unwrap();
             let block = Block::new(cid, data.to_vec()).unwrap();
-            block.decode::<IpldCodec, Ipld>().unwrap();
-            ipfs.put_block(block).await.unwrap();
+            block.to_ipld().unwrap();
+            ipfs.put_block(&block).await.unwrap();
         }
 
         ipfs

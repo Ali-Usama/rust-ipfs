@@ -10,7 +10,9 @@ use libp2p::PeerId;
 use std::collections::hash_map::Entry;
 use std::time::Duration;
 
+use libp2p::core::transport::PortUse;
 use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 
 #[derive(Default, Debug)]
 pub struct Behaviour {
@@ -76,7 +78,7 @@ impl Behaviour {
 
 impl NetworkBehaviour for Behaviour {
     type ConnectionHandler = DummyConnectionHandler;
-    type ToSwarm = void::Void;
+    type ToSwarm = Infallible;
 
     fn handle_pending_inbound_connection(
         &mut self,
@@ -113,6 +115,7 @@ impl NetworkBehaviour for Behaviour {
         _: PeerId,
         _: &Multiaddr,
         _: Endpoint,
+        _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         Ok(DummyConnectionHandler)
     }
